@@ -9,4 +9,4 @@ it itself — no browser engine, no WebView, no OpenSSL or zlib DLLs.
   pure Pascal); server certificates are verified against the Windows certificate store.
 - XelImageFormats - to render .webp images
 
-[image](_demo/demo.png)
+[image](/_demo/demo.png)
