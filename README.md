@@ -8,3 +8,5 @@ it itself — no browser engine, no WebView, no OpenSSL or zlib DLLs.
 - HTTPS is done through [TlsLib4Pascal](https://github.com/Xor-el/TlsLib4Pascal) (TLS 1.2/1.3,
   pure Pascal); server certificates are verified against the Windows certificate store.
 - XelImageFormats - to render .webp images
+
+[image](_demo/demo.png)
