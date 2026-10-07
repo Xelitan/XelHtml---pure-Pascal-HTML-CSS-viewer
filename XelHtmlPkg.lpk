@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <Package Version="5">
+    <Name Value="XelHtmlPkg"/>
+    <Type Value="RunAndDesignTime"/>
+    <Author Value="Xelitan.com"/>
+    <CompilerOptions>
+      <Version Value="11"/>
+      <SearchPaths>
+        <OtherUnitFiles Value="."/>
+        <UnitOutputDirectory Value="lib/xelhtmlpkg/$(TargetCPU)-$(TargetOS)"/>
+      </SearchPaths>
+      <Parsing>
+        <SyntaxOptions>
+          <SyntaxMode Value="Delphi"/>
+        </SyntaxOptions>
+      </Parsing>
+      <CodeGeneration>
+        <SmartLinkUnit Value="True"/>
+        <Optimizations>
+          <OptimizationLevel Value="2"/>
+        </Optimizations>
+      </CodeGeneration>
+      <Linking>
+        <Debugging>
+          <GenerateDebugInfo Value="False"/>
+        </Debugging>
+      </Linking>
+    </CompilerOptions>
+    <Description Value="TXelHtml: HTML + CSS rendering control for building web browsers. Pure Pascal (no browser engine, no OpenSSL/zlib DLLs): HTML parser, CSS cascade with pseudo-classes, flexbox/grid/tables layout, web fonts, images, forms, HTTPS (TlsLib4Pascal), gzip/deflate/br. HTTPS: add package XelHtmlTlsPkg and unit XelHtmlTls to the program."/>
+    <License Value="MIT"/>
+    <Version Major="1"/>
+    <Files Count="22">
+      <Item1>
+        <Filename Value="XelHtml.pas"/>
+        <HasRegisterProc Value="True"/>
+        <UnitName Value="XelHtml"/>
+      </Item1>
+      <Item2>
+        <Filename Value="XelDom.pas"/>
+        <UnitName Value="XelDom"/>
+      </Item2>
+      <Item3>
+        <Filename Value="XelHtmlParser.pas"/>
+        <UnitName Value="XelHtmlParser"/>
+      </Item3>
+      <Item4>
+        <Filename Value="XelCssParser.pas"/>
+        <UnitName Value="XelCssParser"/>
+      </Item4>
+      <Item5>
+        <Filename Value="XelStyle.pas"/>
+        <UnitName Value="XelStyle"/>
+      </Item5>
+      <Item6>
+        <Filename Value="XelLayout.pas"/>
+        <UnitName Value="XelLayout"/>
+      </Item6>
+      <Item7>
+        <Filename Value="XelRender.pas"/>
+        <UnitName Value="XelRender"/>
+      </Item7>
+      <Item8>
+        <Filename Value="XelForms.pas"/>
+        <UnitName Value="XelForms"/>
+      </Item8>
+      <Item9>
+        <Filename Value="XelNet.pas"/>
+        <UnitName Value="XelNet"/>
+      </Item9>
+      <Item10>
+        <Filename Value="XelContentEncoding.pas"/>
+        <UnitName Value="XelContentEncoding"/>
+      </Item10>
+      <Item11>
+        <Filename Value="XelUrl.pas"/>
+        <UnitName Value="XelUrl"/>
+      </Item11>
+      <Item12>
+        <Filename Value="XelTextUtil.pas"/>
+        <UnitName Value="XelTextUtil"/>
+      </Item12>
+      <Item13>
+        <Filename Value="XelImageScale.pas"/>
+        <UnitName Value="XelImageScale"/>
+      </Item13>
+      <Item14>
+        <Filename Value="XelSvgImage.pas"/>
+        <UnitName Value="XelSvgImage"/>
+      </Item14>
+      <Item15>
+        <Filename Value="XelSimpleSVG.pas"/>
+        <UnitName Value="XelSimpleSVG"/>
+      </Item15>
+      <Item16>
+        <Filename Value="OTF.pas"/>
+        <UnitName Value="OTF"/>
+      </Item16>
+      <Item17>
+        <Filename Value="FontTypes.pas"/>
+        <UnitName Value="FontTypes"/>
+      </Item17>
+      <Item18>
+        <Filename Value="TTFParser.pas"/>
+        <UnitName Value="TTFParser"/>
+      </Item18>
+      <Item19>
+        <Filename Value="CFFBuilder.pas"/>
+        <UnitName Value="CFFBuilder"/>
+      </Item19>
+      <Item20>
+        <Filename Value="WOFFCodec.pas"/>
+        <UnitName Value="WOFFCodec"/>
+      </Item20>
+      <Item21>
+        <Filename Value="WOFF2Codec.pas"/>
+        <UnitName Value="WOFF2Codec"/>
+      </Item21>
+      <Item22>
+        <Filename Value="SVGFontReader.pas"/>
+        <UnitName Value="SVGFontReader"/>
+      </Item22>
+    </Files>
+    <CompatibilityMode Value="True"/>
+    <RequiredPkgs Count="4">
+      <Item1>
+        <PackageName Value="XelImageFormats"/>
+        <MinVersion Major="2" Minor="1" Valid="True"/>
+      </Item1>
+      <Item2>
+        <PackageName Value="LazUtils"/>
+      </Item2>
+      <Item3>
+        <PackageName Value="LCL"/>
+      </Item3>
+      <Item4>
+        <PackageName Value="FCL"/>
+      </Item4>
+    </RequiredPkgs>
+    <UsageOptions>
+      <UnitPath Value="$(PkgOutDir)"/>
+    </UsageOptions>
+    <PublishOptions>
+      <Version Value="2"/>
+    </PublishOptions>
+  </Package>
+</CONFIG>

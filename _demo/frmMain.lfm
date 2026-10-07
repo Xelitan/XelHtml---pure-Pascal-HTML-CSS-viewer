@@ -1,0 +1,103 @@
+object MainForm: TMainForm
+  Left = 262
+  Height = 690
+  Top = 190
+  Width = 1024
+  Caption = 'FP HTML Viewer'
+  ClientHeight = 690
+  ClientWidth = 1024
+  KeyPreview = True
+  Position = poScreenCenter
+  LCLVersion = '4.8.0.0'
+  OnCreate = FormCreate
+  OnKeyDown = FormKeyDown
+  object PanelTop: TPanel
+    Left = 0
+    Height = 34
+    Top = 0
+    Width = 1024
+    Align = alTop
+    BevelOuter = bvNone
+    ClientHeight = 34
+    ClientWidth = 1024
+    TabOrder = 0
+    object BtnBack: TButton
+      Left = 0
+      Height = 34
+      Top = 0
+      Width = 36
+      Align = alLeft
+      Caption = '<'
+      Enabled = False
+      TabOrder = 0
+      OnClick = BtnBackClick
+    end
+    object BtnForward: TButton
+      Left = 36
+      Height = 34
+      Top = 0
+      Width = 36
+      Align = alLeft
+      Caption = '>'
+      Enabled = False
+      TabOrder = 1
+      OnClick = BtnForwardClick
+    end
+    object EdUrl: TEdit
+      Left = 76
+      Height = 26
+      Top = 4
+      Width = 784
+      Align = alClient
+      BorderSpacing.Around = 4
+      TabOrder = 2
+      TextHint = 'http(s):// address or path to an .html file'
+      OnKeyPress = EdUrlKeyPress
+    end
+    object BtnGo: TButton
+      Left = 864
+      Height = 34
+      Top = 0
+      Width = 70
+      Align = alRight
+      Caption = 'Go'
+      TabOrder = 3
+      OnClick = BtnGoClick
+    end
+    object BtnOpen: TButton
+      Left = 934
+      Height = 34
+      Top = 0
+      Width = 90
+      Align = alRight
+      Caption = 'Open file...'
+      TabOrder = 4
+      OnClick = BtnOpenClick
+    end
+  end
+  object Html: TXelHtml
+    Left = 0
+    Height = 633
+    Top = 34
+    Width = 1024
+    Align = alClient
+    TabOrder = 1
+    UserAgent = 'Mozilla/5.0 (compatible; XelHtml/1.0)'
+    OnLocationChange = HtmlLocationChange
+    OnTitleChange = HtmlTitleChange
+    OnStatusChange = HtmlStatusChange
+    OnHistoryChange = HtmlHistoryChange
+  end
+  object StatusBar: TStatusBar
+    Left = 0
+    Height = 23
+    Top = 667
+    Width = 1024
+    Panels = <>
+  end
+  object OpenDialog: TOpenDialog
+    Filter = 'HTML files|*.html;*.htm|All files|*.*'
+    Left = 64
+    Top = 96
+  end
+end
