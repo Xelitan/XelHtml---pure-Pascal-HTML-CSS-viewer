@@ -13,9 +13,13 @@ it itself — no browser engine, no WebView, no OpenSSL or zlib DLLs.
 
 # Features
 
-The viewer passes ACID1 test, can load many websites just as well as Firefox or Chrome.
+The viewer passes ACID1 and ACID2 tests, can load many websites just as well as Firefox or Chrome.
 
 - supports local files, http, https
 - supports fonts in WOFF, WOFF2, TTF, OTF and SVG formats
 - loads images in threads
 - supports gif, jpeg, png and webp images
+
+# Systems?
+
+Windows and Linux GTK2
