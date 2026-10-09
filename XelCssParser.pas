@@ -974,24 +974,60 @@ begin
   U := Trim(Copy(Value, P, E - P));
   if (U <> '') and (U[1] in ['"', '''']) then
     U := Copy(U, 2, Length(U) - 2);
-  U := Trim(U);
-  if SameText(Copy(U, 1, 5), 'data:') then
-    Exit;
-  Result := U;
+  // data: URLs are fine too: the resource manager decodes them
+  Result := Trim(U);
 end;
 
-// Removes simple CSS escapes (\x -> x) from a property name (e.g. m\argin).
+// Length of the CSS escape that starts with the backslash at S[I]
+// (CSS 2.1 4.1.3): '\' + 1-6 hex digits + one optional white space, or
+// '\' + any other character. 1 for a backslash at the very end.
+function EscapeLen(const S: string; I: Integer): Integer;
+var
+  J: Integer;
+begin
+  if I >= Length(S) then
+    Exit(1);
+  J := I + 1;
+  while (J <= Length(S)) and (J - I <= 6) and (S[J] in ['0'..'9', 'a'..'f', 'A'..'F']) do
+    Inc(J);
+  if J = I + 1 then
+    Exit(2);                                   // \x: the character itself
+  if (J <= Length(S)) and (S[J] in [' ', #9, #10, #13, #12]) then
+    Inc(J);                                    // the white space ends the escape
+  Result := J - I;
+end;
+
+// Replaces CSS escapes by the characters they stand for: '\a' is U+000A
+// (so m\argin is not 'margin'), '\.' is '.', '\ ' is a space.
 function UnescapeIdent(const S: string): string;
-var I: Integer;
+var
+  I, N, CP: Integer;
+  H: string;
 begin
   Result := '';
   I := 1;
   while I <= Length(S) do
   begin
-    if (S[I] = '\') and (I < Length(S)) then
+    if S[I] = '\' then
     begin
-      Result := Result + S[I + 1];
-      Inc(I, 2);
+      N := EscapeLen(S, I);
+      if N = 1 then
+        Result := Result + '\'
+      else
+      begin
+        H := Trim(Copy(S, I + 1, N - 1));
+        if (Length(H) >= 1) and (H[1] in ['0'..'9', 'a'..'f', 'A'..'F']) and
+           TryStrToInt('$' + H, CP) and (N > 2) or
+           ((N = 2) and (S[I + 1] in ['0'..'9', 'a'..'f', 'A'..'F']) and
+            TryStrToInt('$' + S[I + 1], CP)) then
+        begin
+          if (CP = 0) or (CP > $10FFFF) then CP := $FFFD;
+          Result := Result + UTF8Encode(WideString(WideChar(CP and $FFFF)));
+        end
+        else
+          Result := Result + Copy(S, I + 1, N - 1);
+      end;
+      Inc(I, N);
     end
     else
     begin
@@ -1130,6 +1166,33 @@ var
     Result.Pseudos[High(Result.Pseudos)] := P;
   end;
 
+  // scans a name up to one of the Stop characters, skipping escapes
+  procedure ScanName(const Stop: TSysCharSet);
+  begin
+    while (I <= Len) and not (S[I] in Stop) do
+      if S[I] = '\' then
+        Inc(I, EscapeLen(S, I))
+      else
+        Inc(I);
+  end;
+
+  // an unquoted attribute value must be an identifier: unescaped white space
+  // (as in [class=second two]) makes the selector invalid
+  function ValidIdentValue(const V: string): Boolean;
+  var
+    K: Integer;
+  begin
+    Result := V <> '';
+    K := 1;
+    while Result and (K <= Length(V)) do
+      if V[K] = '\' then
+        Inc(K, EscapeLen(V, K))
+      else if V[K] in [' ', #9, #10, #13, #12, '"', ''''] then
+        Result := False
+      else
+        Inc(K);
+  end;
+
 begin
   Result := TCompoundSel.Create;
   Len := Length(S);
@@ -1146,17 +1209,15 @@ begin
         begin
           Inc(I);
           Start := I;
-          while (I <= Len) and not (S[I] in ['.', '#', '[', ':']) do
-            Inc(I);
-          Result.Id := Copy(S, Start, I - Start);
+          ScanName(['.', '#', '[', ':']);
+          Result.Id := UnescapeIdent(Copy(S, Start, I - Start));
         end;
       '.':
         begin
           Inc(I);
           Start := I;
-          while (I <= Len) and not (S[I] in ['.', '#', '[', ':']) do
-            Inc(I);
-          AddClass(Copy(S, Start, I - Start));
+          ScanName(['.', '#', '[', ':']);
+          AddClass(UnescapeIdent(Copy(S, Start, I - Start)));
         end;
       '[':
         begin
@@ -1192,7 +1253,11 @@ begin
             end;
             AT.Value := Trim(Copy(Val, N + 1, MaxInt));
             if (AT.Value <> '') and (AT.Value[1] in ['"', '''']) then
-              AT.Value := Copy(AT.Value, 2, Length(AT.Value) - 2);
+              AT.Value := UnescapeIdent(Copy(AT.Value, 2, Length(AT.Value) - 2))
+            else if ValidIdentValue(AT.Value) then
+              AT.Value := UnescapeIdent(AT.Value)
+            else
+              Result.Invalid := True;
           end;
           SetLength(Result.Attrs, Length(Result.Attrs) + 1);
           Result.Attrs[High(Result.Attrs)] := AT;
@@ -1246,9 +1311,9 @@ begin
     else
       begin
         Start := I;
-        while (I <= Len) and not (S[I] in ['.', '#', '[', ':', '*']) do
-          Inc(I);
-        Result.Tag := LowerCase(Copy(S, Start, I - Start));
+        ScanName(['.', '#', '[', ':', '*']);
+        // \.parser is the element name '.parser' (matches nothing)
+        Result.Tag := LowerCase(UnescapeIdent(Copy(S, Start, I - Start)));
       end;
     end;
   end;
@@ -1281,6 +1346,13 @@ begin
     while I <= Len do
     begin
       case S[I] of
+        '\':
+          begin
+            // an escaped character (e.g. '\ ' in [class=second\ two]) is part
+            // of the name, never a combinator or a separator
+            Cur := Cur + Copy(S, I, EscapeLen(S, I));
+            Inc(I, EscapeLen(S, I) - 1);
+          end;
         '[', '(':
           begin
             Inc(InBracket);

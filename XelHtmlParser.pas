@@ -432,11 +432,70 @@ begin
   FPos := FLen + 1;
 end;
 
-procedure THtmlParser.ParseBang;
+// Document mode from a DOCTYPE (simplified rules of the HTML spec, 13.2.6.4.1).
+function DoctypeMode(const D: string): TDocCompatMode;
+const
+  // public identifiers that select quirks mode (prefixes, lower case)
+  QuirkPrefixes: array[0..15] of string = (
+    '-//w3c//dtd html 4.0 transitional//', '-//w3c//dtd html 4.0 frameset//',
+    '-//w3c//dtd html 3', '-//w3c//dtd html 2', '-//w3c//dtd w3 html',
+    '-//w3o//', '-//ietf//', '-//netscape', '-//microsoft', '-//softquad',
+    '-//sun microsystems', '-//o''reilly', '-//webtechs', '-//spyglass',
+    '-//metrius', '-//w3c//dtd html experimental');
+var
+  L, Pub, Sys: string;
+  P, Q, I: Integer;
+  Quote: Char;
+
+  function NextQuoted(var At: Integer): string;
+  var
+    E: Integer;
+  begin
+    Result := '';
+    while (At <= Length(L)) and not (L[At] in ['"', '''']) do Inc(At);
+    if At > Length(L) then Exit;
+    Quote := L[At];
+    E := At + 1;
+    while (E <= Length(L)) and (L[E] <> Quote) do Inc(E);
+    Result := Copy(L, At + 1, E - At - 1);
+    At := E + 1;
+  end;
+
 begin
-  // <!DOCTYPE ...> or other <!...> — skip to '>'
+  L := LowerCase(Trim(D));                  // 'doctype html public "..." "..."'
+  Result := dcmStandards;
+  if Copy(L, 1, 7) <> 'doctype' then Exit(dcmQuirks);
+  L := Trim(Copy(L, 8, MaxInt));
+  if Copy(L, 1, 4) <> 'html' then Exit(dcmQuirks);
+  P := Pos('public', L);
+  if P = 0 then Exit;                       // <!DOCTYPE html> (or SYSTEM only)
+  Q := P + 6;
+  Pub := NextQuoted(Q);
+  Sys := NextQuoted(Q);
+  for I := 0 to High(QuirkPrefixes) do
+    if Copy(Pub, 1, Length(QuirkPrefixes[I])) = QuirkPrefixes[I] then
+      Exit(dcmQuirks);
+  if (Copy(Pub, 1, 36) = '-//w3c//dtd html 4.01 transitional//') or
+     (Copy(Pub, 1, 32) = '-//w3c//dtd html 4.01 frameset//') then
+  begin
+    if Sys = '' then Exit(dcmQuirks);
+    Exit(dcmLimitedQuirks);
+  end;
+  if (Copy(Pub, 1, 36) = '-//w3c//dtd xhtml 1.0 transitional//') or
+     (Copy(Pub, 1, 32) = '-//w3c//dtd xhtml 1.0 frameset//') then
+    Exit(dcmLimitedQuirks);
+end;
+
+procedure THtmlParser.ParseBang;
+var
+  Start: Integer;
+begin
+  // <!DOCTYPE ...> or other <!...> — skip to '>'; a DOCTYPE sets the document mode
+  Start := FPos + 2;
   while (FPos <= FLen) and (FSrc[FPos] <> '>') do
     Inc(FPos);
+  if SameText(Copy(FSrc, Start, 7), 'doctype') then
+    FDoc.CompatMode := DoctypeMode(Copy(FSrc, Start, FPos - Start));
   if FPos <= FLen then
     Inc(FPos);
 end;

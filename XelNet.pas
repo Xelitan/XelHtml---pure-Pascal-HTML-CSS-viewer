@@ -144,12 +144,22 @@ var
   Body: TRawByteStringStream;
   Path, Encoding: string;
   I, Attempt: Integer;
+  DataBytes: RawByteString;
+  DataMime: string;
 begin
   try
     if IsHttpsUrl(Res.Url) and (TSSLSocketHandler.GetDefaultHandlerClass = nil) then
       raise Exception.Create('HTTPS support is not linked into the program: ' +
         'add the XelHtmlTls unit (package XelHtmlTlsPkg) to the uses clause');
-    if IsHttpUrl(Res.Url) or IsHttpsUrl(Res.Url) then
+    if DecodeDataUrl(Res.Url, DataBytes, DataMime) then
+    begin
+      // data: URL (e.g. a <link> to data:text/css,...): the bytes are in the URL
+      if DataBytes <> '' then
+        Res.Data.WriteBuffer(DataBytes[1], Length(DataBytes));
+      Res.Data.Position := 0;
+      Res.State := rsLoaded;
+    end
+    else if IsHttpUrl(Res.Url) or IsHttpsUrl(Res.Url) then
     begin
       Client := TFPHttpClient.Create(nil);
       try
@@ -220,11 +230,7 @@ begin
     else
     begin
       // local file
-      Path := Res.Url;
-      if SameText(Copy(Path, 1, 8), 'file:///') then
-        Path := StringReplace(Copy(Path, 9, MaxInt), '/', '\', [rfReplaceAll])
-      else if SameText(Copy(Path, 1, 7), 'file://') then
-        Path := StringReplace(Copy(Path, 8, MaxInt), '/', '\', [rfReplaceAll]);
+      Path := FileUrlToPath(Res.Url);
       if not FileExists(Path) then
       begin
         Res.State := rsError;
@@ -283,7 +289,19 @@ begin
   for RT := Low(TResourceType) to High(TResourceType) do
   begin
     FQueues[RT] := TQueue<TResource>.Create;
+    {$IFDEF UNIX}
+    // without a thread manager (cthreads) FPC cannot create events or threads
+    try
+      FEvents[RT] := TEvent.Create(nil, False, False, '');
+    except
+      on E: Exception do
+        raise Exception.Create('TXelHtml needs threads: add {$IFDEF UNIX}cthreads,' +
+          '{$ENDIF} as the first unit in the uses clause of the program (' +
+          E.Message + ')');
+    end;
+    {$ELSE}
     FEvents[RT] := TEvent.Create(nil, False, False, '');
+    {$ENDIF}
   end;
 
   // one thread each for HTML, JS, CSS and fonts; images — five

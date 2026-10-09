@@ -16,11 +16,17 @@ unit OTF;
 //
 // The conversion is pure Pascal (font converter units) — no external
 // programs or DLLs (except gdi32/gdiplus for installation and drawing).
+//
+// On Linux/Unix there is no GDI/GDI+: fonts are added to fontconfig as
+// application fonts (libfontconfig, loaded at run time) and the GDI+ drawing
+// functions return False, so the caller draws with the LCL canvas
+// (Pango/Cairo, already anti-aliased).
 
 interface
 
 uses
-  Classes, SysUtils, Math, Windows,
+  Classes, SysUtils, Math,
+  {$IFDEF MSWINDOWS}Windows,{$ELSE}LCLType, dynlibs,{$ENDIF}
   FontTypes, TTFParser, CFFBuilder, WOFFCodec, WOFF2Codec, SVGFontReader;
 
 type
@@ -411,15 +417,109 @@ end;
 // Temporary font installation from memory
 // =============================================================
 
+{$IFDEF MSWINDOWS}
 function GdiAddFontMemResourceEx(pbFont: Pointer; cbFont: DWORD;
   pdv: Pointer; pcFonts: PDWORD): THandle; stdcall;
   external 'gdi32.dll' name 'AddFontMemResourceEx';
 function GdiRemoveFontMemResourceEx(fh: THandle): LongBool; stdcall;
   external 'gdi32.dll' name 'RemoveFontMemResourceEx';
 
-function InstallTempFont(const OtfData: TBytes; out Font: TTempFont): Boolean;
+// Installs the font for this process; returns the handle, 0 on failure.
+function AddFontData(const Data: TBytes): THandle;
 var
   Cnt: DWORD;
+begin
+  Cnt := 0;
+  Result := GdiAddFontMemResourceEx(@Data[0], Length(Data), nil, @Cnt);
+  if (Result <> 0) and (Cnt = 0) then
+    Result := 0;
+end;
+{$ELSE}
+// fontconfig application fonts. fontconfig only takes files, so every font is
+// written to a private temp folder (removed at exit); the files must stay
+// while the process runs because FreeType reads them on demand.
+var
+  GFcTried: Boolean = False;
+  FcConfigAppFontAddFile: function(Config: Pointer; FileName: PChar): LongInt; cdecl = nil;
+  // Pango caches font lookups; after adding a font its font map must be told
+  // that the fontconfig configuration changed (GTK widgetsets)
+  PangoCairoFontMapGetDefault: function: Pointer; cdecl = nil;
+  PangoFcFontMapConfigChanged: procedure(FontMap: Pointer); cdecl = nil;
+  GFontDir: string = '';
+  GFontFiles: Integer = 0;
+
+procedure LoadFontconfig;
+var
+  Lib: TLibHandle;
+begin
+  if GFcTried then Exit;
+  GFcTried := True;
+  Lib := LoadLibrary('libfontconfig.so.1');
+  if Lib <> NilHandle then
+    @FcConfigAppFontAddFile := GetProcedureAddress(Lib, 'FcConfigAppFontAddFile');
+  Lib := LoadLibrary('libpangocairo-1.0.so.0');
+  if Lib <> NilHandle then
+    @PangoCairoFontMapGetDefault :=
+      GetProcedureAddress(Lib, 'pango_cairo_font_map_get_default');
+  Lib := LoadLibrary('libpangoft2-1.0.so.0');
+  if Lib <> NilHandle then
+    @PangoFcFontMapConfigChanged :=
+      GetProcedureAddress(Lib, 'pango_fc_font_map_config_changed');
+end;
+
+// Installs the font for this process; returns 1, or 0 on failure.
+function AddFontData(const Data: TBytes): THandle;
+var
+  FileName: string;
+  FS: TFileStream;
+begin
+  Result := 0;
+  LoadFontconfig;
+  if not Assigned(FcConfigAppFontAddFile) then Exit;
+  if GFontDir = '' then
+  begin
+    GFontDir := IncludeTrailingPathDelimiter(GetTempDir(False)) +
+      'xelhtml-fonts-' + IntToStr(GetProcessID);
+    if not ForceDirectories(GFontDir) then
+    begin
+      GFontDir := '';
+      Exit;
+    end;
+  end;
+  Inc(GFontFiles);
+  FileName := GFontDir + PathDelim + 'font' + IntToStr(GFontFiles) + '.otf';
+  try
+    FS := TFileStream.Create(FileName, fmCreate);
+    try
+      FS.WriteBuffer(Data[0], Length(Data));
+    finally
+      FS.Free;
+    end;
+  except
+    Exit;
+  end;
+  if FcConfigAppFontAddFile(nil, PChar(FileName)) = 0 then
+  begin
+    DeleteFile(FileName);
+    Exit;
+  end;
+  if Assigned(PangoCairoFontMapGetDefault) and Assigned(PangoFcFontMapConfigChanged) then
+    PangoFcFontMapConfigChanged(PangoCairoFontMapGetDefault());
+  Result := 1;
+end;
+
+procedure RemoveFontFiles;
+var
+  I: Integer;
+begin
+  if GFontDir = '' then Exit;
+  for I := 1 to GFontFiles do
+    DeleteFile(GFontDir + PathDelim + 'font' + IntToStr(I) + '.otf');
+  RemoveDir(GFontDir);
+end;
+{$ENDIF}
+
+function InstallTempFont(const OtfData: TBytes; out Font: TTempFont): Boolean;
 begin
   Font.Handle := 0;
   Font.Data := nil;
@@ -428,10 +528,8 @@ begin
   if Length(OtfData) = 0 then Exit;
 
   Font.Data := Copy(OtfData, 0, Length(OtfData));
-  Cnt := 0;
-  Font.Handle := GdiAddFontMemResourceEx(@Font.Data[0], Length(Font.Data),
-    nil, @Cnt);
-  if (Font.Handle <> 0) and (Cnt > 0) then
+  Font.Handle := AddFontData(Font.Data);
+  if Font.Handle <> 0 then
   begin
     Font.Family := ReadSfntFamilyName(Font.Data);
     Result := True;
@@ -454,13 +552,17 @@ end;
 
 procedure UninstallTempFont(var Font: TTempFont);
 begin
+  {$IFDEF MSWINDOWS}
   if Font.Handle <> 0 then
     GdiRemoveFontMemResourceEx(Font.Handle);
+  {$ENDIF}
+  // fontconfig cannot remove a single application font; it stays until exit
   Font.Handle := 0;
   Font.Data := nil;
   Font.Family := '';
 end;
 
+{$IFDEF MSWINDOWS}
 // =============================================================
 // Rendering via GDI+ (gdiplus.dll, flat API)
 // =============================================================
@@ -683,7 +785,6 @@ function RegisterBrowserFont(const Raw: TBytes; const CssFamily: string;
   out InternalFamily: string): Boolean;
 var
   Otf: TBytes;
-  Cnt: DWORD;
   N: Integer;
 begin
   Result := False;
@@ -696,8 +797,7 @@ begin
   if Length(Otf) = 0 then Exit;
 
   // 1) GDI — for text measurement in the layout engine
-  Cnt := 0;
-  if GdiAddFontMemResourceEx(@Otf[0], Length(Otf), nil, @Cnt) = 0 then Exit;
+  if AddFontData(Otf) = 0 then Exit;
   Result := True;
   InternalFamily := ReadSfntFamilyName(Otf);
 
@@ -884,11 +984,55 @@ begin
   GFontData := nil;
 end;
 
+{$ELSE}
+// No GDI+ outside Windows: callers fall back to the LCL canvas.
+
+function GdiPlusReady: Boolean;
+begin
+  Result := False;
+end;
+
+function DrawTextGdiPlusMem(DC: HDC; const FontData: TBytes;
+  const FamilyName: WideString; const Text: WideString;
+  X, Y, EmSize: Single; Color: LongWord; Bold, Italic: Boolean): Boolean;
+begin
+  Result := False;
+end;
+
+function RegisterBrowserFont(const Raw: TBytes; const CssFamily: string;
+  out InternalFamily: string): Boolean;
+var
+  Otf: TBytes;
+begin
+  Result := False;
+  InternalFamily := '';
+  if Length(Raw) = 0 then Exit;
+  // any format -> OTF/SFNT
+  if not ConvertBytesToOTF(Raw, Otf) then
+    Otf := Raw;
+  if Length(Otf) = 0 then Exit;
+  if AddFontData(Otf) = 0 then Exit;
+  Result := True;
+  InternalFamily := ReadSfntFamilyName(Otf);
+end;
+
+function DrawTextGdiPlus(DC: HDC; const FamilyName: string; EmSizePx: Integer;
+  Bold, Italic: Boolean; ColorRef: LongWord; X, BaselineY: Single;
+  const Text: string; GdiAdvances: Boolean): Boolean;
+begin
+  Result := False;
+end;
+{$ENDIF}
+
 initialization
 
 finalization
+  {$IFDEF MSWINDOWS}
   FreeGdiPlusCaches;
   if GReady and (GToken <> 0) then
     GdiplusShutdown(GToken);
+  {$ELSE}
+  RemoveFontFiles;
+  {$ENDIF}
 
 end.

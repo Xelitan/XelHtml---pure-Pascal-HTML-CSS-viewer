@@ -10,7 +10,8 @@ unit XelSimpleSVG;
 interface
 
 uses
-  Classes, SysUtils, Math, DOM, XMLRead, Windows, Types, Graphics;
+  Classes, SysUtils, Math, DOM, XMLRead,
+  {$IFDEF MSWINDOWS}Windows,{$ELSE}LCLType, LCLIntf,{$ENDIF} Types, Graphics;
 
 function RenderSimpleSVGToBitmap(const ASVGText: string; ABitmap: TBitmap;
   ABgColor: TColor = clWhite): Boolean;
@@ -1481,8 +1482,29 @@ begin
     ACanvas.Brush.Color := SavedFillColor;
     ACanvas.Pen.Style   := psClear;
 
+    {$IFDEF MSWINDOWS}
     SetPolyFillMode(ACanvas.Handle, ALTERNATE);
     Windows.PolyPolygon(ACanvas.Handle, AllPts[0], Counts[0], SubPathCount);
+    {$ELSE}
+    // no PolyPolygon in the LCL: one polygon where every sub-path after the
+    // first is reached from, and returns to, the first point. Each bridge edge
+    // is crossed twice, so it does not change the even-odd fill.
+    SetLength(AllPts, TotalPts + 3 * SubPathCount);
+    FK := 0;
+    for FJ := 0 to SubPathCount - 1 do
+    begin
+      Move(SubPaths[FJ].Pts[0], AllPts[FK], Counts[FJ] * SizeOf(TPoint));
+      Inc(FK, Counts[FJ]);
+      AllPts[FK] := SubPaths[FJ].Pts[0];       // close the sub-path
+      Inc(FK);
+      if FJ > 0 then
+      begin
+        AllPts[FK] := SubPaths[0].Pts[0];      // bridge back to the start
+        Inc(FK);
+      end;
+    end;
+    ACanvas.Polygon(AllPts, False, 0, FK);
+    {$ENDIF}
   end;
 
   // --- Stroke pass: each sub-path drawn as outline individually ---

@@ -50,9 +50,13 @@ type
     HasBgColor: Boolean;
     BgColor: TColor;
     BgImage: string; // absolute URL
-    BgRepeat: Boolean;
+    BgRepeat: Boolean;  // BgRepeatX or BgRepeatY (legacy)
+    BgRepeatX, BgRepeatY: Boolean;
+    BgFixed: Boolean;   // background-attachment: fixed (positioned in the viewport)
     BgSizeW, BgSizeH: Integer; // -1 = natural size
+    // background-position: Pct of (area - image) plus Px (CSS 2.1 14.2.1)
     BgPosXPct, BgPosYPct: Double;
+    BgPosXPx, BgPosYPx: Integer;
 
     GradKind: TCssGradientKind;     // gradient background (linear/radial)
     GradAngle: Double;              // CSS angle in degrees (linear)
@@ -87,7 +91,14 @@ type
     FontFamily: string;
     FontSizePx: Integer;
     Bold, Italic, Underline, Strike: Boolean;
-    LineHeight: Double; // font size multiplier
+    LineHeight: Double; // font size multiplier (line-height given as a number)
+    // line-height given as a length or percentage: computed to px and inherited
+    // as px (CSS 2.1 10.8.1); -1 = a number or normal
+    LineHeightPx: Integer;
+    LineHeightNormal: Boolean; // line-height: normal (the font's own height)
+    // the top/bottom margin comes from the user-agent style sheet (quirks mode
+    // ignores such margins at the top/bottom of <body> and table cells)
+    MarginTFromUA, MarginBFromUA: Boolean;
 
     MarginL, MarginT, MarginR, MarginB: Integer;
     MarginLAuto, MarginRAuto: Boolean;
@@ -99,7 +110,12 @@ type
     BordL, BordT, BordR, BordB: Integer;
     BorderColor: TColor;                       // main one (also for controls)
     BorderColorT, BorderColorR, BorderColorB, BorderColorL: TColor; // per side
-    BorderStyle: TCssBorderStyle;
+    BorderStyle: TCssBorderStyle;             // first side with a border (legacy)
+    // per side; a side whose style is none has a used width of 0 (CSS 2.1 8.5)
+    BorderStyleT, BorderStyleR, BorderStyleB, BorderStyleL: TCssBorderStyle;
+    // specified widths while the cascade runs (initial: medium = 3); the used
+    // widths BordT..BordL are set from them by FinalizeBorders
+    BordSpecT, BordSpecR, BordSpecB, BordSpecL: Integer;
 
     WidthPx: Integer;   // -1 = auto
     MaxWidthPx: Integer; // -1 = no limit
@@ -143,6 +159,7 @@ type
     BoxShadowColor: TColor;
 
     constructor Create;
+    procedure FinalizeBorders; // used border widths from styles + specified widths
     procedure InheritFrom(Parent: TComputedStyle);
   end;
 
@@ -170,11 +187,17 @@ type
   end;
 
 function ParseCssColor(const Value: string; out Color: TColor): Boolean;
+// the used line-height in px, or -1 for 'normal' (use the font's own height)
+function UsedLineHeight(St: TComputedStyle): Integer;
+// False for declarations a browser drops as invalid that ApplyDecl would
+// otherwise accept: a unitless non-zero length outside quirks mode
+// ('width: 200'), a background with two colours ('background: red pink')
+function DeclValueValid(const Prop, Value: string; Quirks: Boolean): Boolean;
 
 implementation
 
 uses
-  Math, XelUrl, XelTextUtil;
+  Math, StrUtils, XelUrl, XelTextUtil;
 
 const
   // Browser default style sheet — parsed with our own CSS parser
@@ -185,12 +208,12 @@ const
     '{display:block}' +
     'head,script,style,meta,link,title,base,template{display:none}' +
     'li{display:list-item}' +
-    'table{display:table}' +
+    'table{display:table;border-spacing:2px}' +
     'tr{display:table-row}' +
     'td,th{display:table-cell}' +
     'caption{display:block}' +
     'body{margin:8px}' +
-    'p,blockquote,ul,ol,dl,pre,table,figure{margin-top:1em;margin-bottom:1em}' +
+    'p,blockquote,ul,ol,dl,pre,figure{margin-top:1em;margin-bottom:1em}' +
     'blockquote{margin-left:40px;margin-right:40px}' +
     'figure{margin-left:40px;margin-right:40px}' +
     'h1{font-size:2em;font-weight:bold;margin-top:0.67em;margin-bottom:0.67em}' +
@@ -494,6 +517,11 @@ begin
   HasBgColor := False;
   BgColor := clWhite;
   BgRepeat := True;
+  BgRepeatX := True;
+  BgRepeatY := True;
+  BgFixed := False;
+  BgPosXPx := 0;
+  BgPosYPx := 0;
   BgSizeW := -1;
   BgSizeH := -1;
   BgPosXPct := 0;
@@ -528,6 +556,8 @@ begin
   FontFamily := 'serif';
   FontSizePx := 16;
   LineHeight := 1.25;
+  LineHeightPx := -1;
+  LineHeightNormal := True;
   WidthPx := -1;
   MaxWidthPx := -1;
   MaxWidthPct := -1;
@@ -554,6 +584,9 @@ begin
   BorderColorB := clBlack;
   BorderColorL := clBlack;
   BorderStyle := cbsNone;
+  BorderStyleT := cbsNone; BorderStyleR := cbsNone;
+  BorderStyleB := cbsNone; BorderStyleL := cbsNone;
+  BordSpecT := 3; BordSpecR := 3; BordSpecB := 3; BordSpecL := 3;
   MarginLPct := -1;
   MarginTPct := -1;
   MarginRPct := -1;
@@ -571,8 +604,8 @@ begin
   WordSpacing := 0;
   Cursor := ccrAuto;
   BorderCollapse := False;
-  BorderSpacingH := 2;
-  BorderSpacingV := 2;
+  BorderSpacingH := 0;   // initial value; the UA sheet gives <table> 2px
+  BorderSpacingV := 0;
   HasTextShadow := False;
   TextShadowX := 0;
   TextShadowY := 0;
@@ -587,6 +620,24 @@ begin
   BoxShadowColor := clBlack;
 end;
 
+procedure TComputedStyle.FinalizeBorders;
+
+  function Used(BS: TCssBorderStyle; W: Integer): Integer;
+  begin
+    if BS = cbsNone then Result := 0 else Result := Max(0, W);
+  end;
+
+begin
+  BordT := Used(BorderStyleT, BordSpecT);
+  BordR := Used(BorderStyleR, BordSpecR);
+  BordB := Used(BorderStyleB, BordSpecB);
+  BordL := Used(BorderStyleL, BordSpecL);
+  if BorderStyleT <> cbsNone then BorderStyle := BorderStyleT
+  else if BorderStyleL <> cbsNone then BorderStyle := BorderStyleL
+  else if BorderStyleR <> cbsNone then BorderStyle := BorderStyleR
+  else BorderStyle := BorderStyleB;
+end;
+
 procedure TComputedStyle.InheritFrom(Parent: TComputedStyle);
 begin
   if Parent = nil then
@@ -599,6 +650,8 @@ begin
   Underline := Parent.Underline;
   Strike := Parent.Strike;
   LineHeight := Parent.LineHeight;
+  LineHeightPx := Parent.LineHeightPx;
+  LineHeightNormal := Parent.LineHeightNormal;
   TextAlign := Parent.TextAlign;
   ListType := Parent.ListType;
   ListImage := Parent.ListImage;
@@ -871,8 +924,64 @@ end;
 // Splits the `font` shorthand into size, line height and family.
 // CSS syntax: [style||variant||weight]? font-size[/line-height] font-family
 // Returns False when no size can be found (e.g. 'inherit', 'caption').
+function DeclValueValid(const Prop, Value: string; Quirks: Boolean): Boolean;
+const
+  LengthProps: array[0..27] of string = ('width', 'height', 'min-width',
+    'min-height', 'max-width', 'max-height', 'margin', 'margin-top',
+    'margin-right', 'margin-bottom', 'margin-left', 'padding', 'padding-top',
+    'padding-right', 'padding-bottom', 'padding-left', 'top', 'right',
+    'bottom', 'left', 'border-width', 'border-top-width', 'border-right-width',
+    'border-bottom-width', 'border-left-width', 'font-size', 'letter-spacing',
+    'word-spacing');
+var
+  Tokens: TStringList;
+  T: string;
+  I, Colors: Integer;
+  D: Double;
+  Col: TColor;
+  FS: TFormatSettings;
+begin
+  Result := True;
+  Tokens := TStringList.Create;
+  try
+    SplitValueTokens(Value, Tokens);
+    if not Quirks and MatchStr(Prop, LengthProps) then
+    begin
+      FS := DefaultFormatSettings;
+      FS.DecimalSeparator := '.';
+      for T in Tokens do
+        if TryStrToFloat(T, D, FS) and (D <> 0) then
+          Exit(False);
+    end;
+    if Prop = 'background' then
+    begin
+      Colors := 0;
+      for I := 0 to Tokens.Count - 1 do
+        if (Pos('(', Tokens[I]) = 0) and ParseCssColor(Tokens[I], Col) then
+          Inc(Colors);
+      if Colors > 1 then
+        Exit(False);
+    end;
+  finally
+    Tokens.Free;
+  end;
+end;
+
+// The used line-height in px, or -1 for 'normal' (the caller uses the
+// font's own height then).
+function UsedLineHeight(St: TComputedStyle): Integer;
+begin
+  if St.LineHeightNormal then
+    Result := -1
+  else if St.LineHeightPx >= 0 then
+    Result := St.LineHeightPx
+  else
+    Result := Round(St.FontSizePx * St.LineHeight);
+end;
+
+// PreS: the words before the size (style, variant, weight), space separated
 function ParseFontShorthand(const V: string;
-  out SizeS, LHs, FamS: string): Boolean;
+  out SizeS, LHs, FamS, PreS: string): Boolean; overload;
 var
   W: TStringList;
   I, SizeIdx, P: Integer;
@@ -899,7 +1008,7 @@ var
   end;
 
 begin
-  Result := False; SizeS := ''; LHs := ''; FamS := '';
+  Result := False; SizeS := ''; LHs := ''; FamS := ''; PreS := '';
   W := TStringList.Create;
   try
     W.Delimiter := ' '; W.StrictDelimiter := False;
@@ -917,6 +1026,8 @@ begin
     end
     else
       SizeS := T;
+    for I := 0 to SizeIdx - 1 do
+      PreS := PreS + Trim(W[I]) + ' ';
     for I := SizeIdx + 1 to W.Count - 1 do
     begin
       if FamS <> '' then FamS := FamS + ' ';
@@ -927,6 +1038,15 @@ begin
     W.Free;
   end;
 end;
+
+function ParseFontShorthand(const V: string;
+  out SizeS, LHs, FamS: string): Boolean; overload;
+var
+  PreS: string;
+begin
+  Result := ParseFontShorthand(V, SizeS, LHs, FamS, PreS);
+end;
+
 
 procedure ParseGridLine(const V: string; out StartL, EndL, Span: Integer);
 var
@@ -973,7 +1093,16 @@ begin
   else if (Prop = 'text-decoration') or (Prop = 'text-decoration-line') then
     begin CS.Underline := Parent.Underline; CS.Strike := Parent.Strike; end
   else if Prop = 'text-align' then CS.TextAlign := Parent.TextAlign
-  else if Prop = 'line-height' then CS.LineHeight := Parent.LineHeight
+  else if Prop = 'line-height' then
+    begin CS.LineHeight := Parent.LineHeight; CS.LineHeightPx := Parent.LineHeightPx;
+          CS.LineHeightNormal := Parent.LineHeightNormal; end
+  else if Prop = 'font' then
+    begin
+      CS.FontSizePx := Parent.FontSizePx; CS.FontFamily := Parent.FontFamily;
+      CS.Bold := Parent.Bold; CS.Italic := Parent.Italic;
+      CS.LineHeight := Parent.LineHeight; CS.LineHeightPx := Parent.LineHeightPx;
+      CS.LineHeightNormal := Parent.LineHeightNormal;
+    end
   else if Prop = 'white-space' then
     begin CS.PreWhiteSpace := Parent.PreWhiteSpace; CS.NoWrap := Parent.NoWrap; end
   else if (Prop = 'list-style') or (Prop = 'list-style-type') then
@@ -1020,27 +1149,34 @@ begin
   else if Prop = 'border-right-color' then CS.BorderColorR := Parent.BorderColorR
   else if Prop = 'border-bottom-color' then CS.BorderColorB := Parent.BorderColorB
   else if Prop = 'border-left-color' then CS.BorderColorL := Parent.BorderColorL
-  else if Prop = 'border-style' then CS.BorderStyle := Parent.BorderStyle
+  else if Prop = 'border-style' then
+    begin CS.BorderStyleT := Parent.BorderStyleT; CS.BorderStyleR := Parent.BorderStyleR;
+          CS.BorderStyleB := Parent.BorderStyleB; CS.BorderStyleL := Parent.BorderStyleL; end
   else if (Prop = 'border') or (Prop = 'border-width') then
   begin
-    CS.BordL := Parent.BordL; CS.BordT := Parent.BordT;
-    CS.BordR := Parent.BordR; CS.BordB := Parent.BordB;
+    CS.BordSpecL := Parent.BordL; CS.BordSpecT := Parent.BordT;
+    CS.BordSpecR := Parent.BordR; CS.BordSpecB := Parent.BordB;
     if Prop = 'border' then
     begin
       CS.BorderColor := Parent.BorderColor;
       CS.BorderColorT := Parent.BorderColorT; CS.BorderColorR := Parent.BorderColorR;
       CS.BorderColorB := Parent.BorderColorB; CS.BorderColorL := Parent.BorderColorL;
-      CS.BorderStyle := Parent.BorderStyle;
+      CS.BorderStyleT := Parent.BorderStyleT; CS.BorderStyleR := Parent.BorderStyleR;
+      CS.BorderStyleB := Parent.BorderStyleB; CS.BorderStyleL := Parent.BorderStyleL;
     end;
   end
   else if Prop = 'border-top' then
-    begin CS.BordT := Parent.BordT; CS.BorderColorT := Parent.BorderColorT; end
+    begin CS.BordSpecT := Parent.BordT; CS.BorderColorT := Parent.BorderColorT;
+          CS.BorderStyleT := Parent.BorderStyleT; end
   else if Prop = 'border-right' then
-    begin CS.BordR := Parent.BordR; CS.BorderColorR := Parent.BorderColorR; end
+    begin CS.BordSpecR := Parent.BordR; CS.BorderColorR := Parent.BorderColorR;
+          CS.BorderStyleR := Parent.BorderStyleR; end
   else if Prop = 'border-bottom' then
-    begin CS.BordB := Parent.BordB; CS.BorderColorB := Parent.BorderColorB; end
+    begin CS.BordSpecB := Parent.BordB; CS.BorderColorB := Parent.BorderColorB;
+          CS.BorderStyleB := Parent.BorderStyleB; end
   else if Prop = 'border-left' then
-    begin CS.BordL := Parent.BordL; CS.BorderColorL := Parent.BorderColorL; end
+    begin CS.BordSpecL := Parent.BordL; CS.BorderColorL := Parent.BorderColorL;
+          CS.BorderStyleL := Parent.BorderStyleL; end
   else if Prop = 'margin' then
     begin CS.MarginL := Parent.MarginL; CS.MarginT := Parent.MarginT;
           CS.MarginR := Parent.MarginR; CS.MarginB := Parent.MarginB;
@@ -1210,9 +1346,97 @@ var
     end;
   end;
 
+  procedure SetBgRepeat(const R: string);
+  begin
+    if R = 'no-repeat' then begin CS.BgRepeatX := False; CS.BgRepeatY := False; end
+    else if R = 'repeat-x' then begin CS.BgRepeatX := True; CS.BgRepeatY := False; end
+    else if R = 'repeat-y' then begin CS.BgRepeatX := False; CS.BgRepeatY := True; end
+    else if R = 'repeat' then begin CS.BgRepeatX := True; CS.BgRepeatY := True; end;
+    CS.BgRepeat := CS.BgRepeatX or CS.BgRepeatY;
+  end;
+
+  // background-position: 1-2 values; keywords, percentages or lengths. A
+  // single value means the other one is 'center'; top/bottom name the
+  // vertical position even when they come first.
+  procedure SetBgPosition(Toks: TStrings);
+  var
+    J, LPx: Integer;
+    LPct: Double;
+    W: string;
+    XPct, YPct: Double;
+    XPx, YPx: Integer;
+    XSet, YSet: Boolean;
+
+    procedure Take(IsX: Boolean; APct: Double; APx: Integer);
+    begin
+      if IsX then begin XPct := APct; XPx := APx; XSet := True; end
+      else begin YPct := APct; YPx := APx; YSet := True; end;
+    end;
+
+  begin
+    XPct := 50; YPct := 50; XPx := 0; YPx := 0;
+    XSet := False; YSet := False;
+    for J := 0 to Min(1, Toks.Count - 1) do
+    begin
+      W := LowerCase(Toks[J]);
+      if W = 'left' then Take(True, 0, 0)
+      else if W = 'right' then Take(True, 100, 0)
+      else if W = 'top' then Take(False, 0, 0)
+      else if W = 'bottom' then Take(False, 100, 0)
+      else if W = 'center' then
+        Take((J = 0) and not XSet, 50, 0)
+      else
+        case ParseLength(Toks[J], CS.FontSizePx, LPx, LPct) of
+          lkPct: Take(not XSet, LPct, 0);
+          lkPx: Take(not XSet, 0, LPx);
+        end;
+    end;
+    CS.BgPosXPct := XPct; CS.BgPosXPx := XPx;
+    CS.BgPosYPct := YPct; CS.BgPosYPx := YPx;
+  end;
+
+  // CSS box shorthand with 1-4 values: which value a side (0 top, 1 right,
+  // 2 bottom, 3 left) takes — 1: all; 2: vertical, horizontal;
+  // 3: top, horizontal, bottom; 4: top, right, bottom, left
+  function BoxSideIdx(Count, Side: Integer): Integer;
+  const
+    Map: array[1..4, 0..3] of Integer =
+      ((0, 0, 0, 0), (0, 1, 0, 1), (0, 1, 2, 1), (0, 1, 2, 3));
+  begin
+    Result := Map[Count, Side];
+  end;
+
   procedure SetAllBorderW(W: Integer);
   begin
-    CS.BordL := W; CS.BordT := W; CS.BordR := W; CS.BordB := W;
+    CS.BordSpecL := W; CS.BordSpecT := W; CS.BordSpecR := W; CS.BordSpecB := W;
+  end;
+
+  // a border width: thin/medium/thick or a non-negative length
+  function ParseBorderWidthWord(const T: string; out W: Integer): Boolean;
+  var
+    L: string;
+    LPx: Integer;
+    LPct: Double;
+  begin
+    Result := True;
+    L := LowerCase(T);
+    if L = 'thin' then W := 1
+    else if L = 'medium' then W := 3
+    else if L = 'thick' then W := 5
+    else if (ParseLength(T, CS.FontSizePx, LPx, LPct) = lkPx) and (LPx >= 0) then W := LPx
+    else Result := False;
+  end;
+
+  // border colour: like ParseCssColor, plus 'transparent' (clNone = not drawn)
+  function ParseBorderColor(const T: string; out C: TColor): Boolean;
+  begin
+    if SameText(T, 'transparent') then
+    begin
+      C := clNone;
+      Result := True;
+    end
+    else
+      Result := ParseCssColor(T, C);
   end;
 
   procedure SetAllBorderColor(C: TColor);
@@ -1246,10 +1470,15 @@ var
 
 var
   BS: TCssBorderStyle;
+  BWs: array of Integer;
+  PosToks: TStringList;
+  TmpCol: TColor;
+  TmpW: Integer;
+  BSs: array of TCssBorderStyle;
   W: Integer;
   VL: string;
   BoolTmp, BoolTmp2: Boolean;
-  FSizeS, FLhS, FFamS: string;
+  FSizeS, FLhS, FFamS, FPreS, FPreW: string;
 begin
   V := Trim(Value);
   if V = '' then
@@ -1348,32 +1577,48 @@ begin
 
   else if Prop = 'background' then
   begin
+    // a shorthand resets every sub-property it does not name (CSS 2.1 14.2.1)
+    CS.BgImage := '';
+    CS.HasBgColor := False;
+    CS.GradKind := gkNone;
+    SetBgRepeat('repeat');
+    CS.BgFixed := False;
+    CS.BgPosXPct := 0; CS.BgPosYPct := 0; CS.BgPosXPx := 0; CS.BgPosYPx := 0;
     Tokens := TStringList.Create;
+    PosToks := TStringList.Create;
     try
       SplitValueTokens(V, Tokens);
       for I := 0 to Tokens.Count - 1 do
       begin
-        if (Pos('linear-gradient(', LowerCase(Tokens[I])) = 1) or
-           (Pos('radial-gradient(', LowerCase(Tokens[I])) = 1) then
+        VL := LowerCase(Tokens[I]);
+        if (Pos('linear-gradient(', VL) = 1) or (Pos('radial-gradient(', VL) = 1) then
           ParseGradientValue(Tokens[I], CS)
-        else if SameText(Copy(Tokens[I], 1, 4), 'url(') then
+        else if Copy(VL, 1, 4) = 'url(' then
           CS.BgImage := ExtractFirstUrl(Tokens[I])
-        else if SameText(Tokens[I], 'none') then
-        begin
-          CS.BgImage := '';
-          CS.HasBgColor := False;
-          CS.GradKind := gkNone;
-        end
+        else if VL = 'none' then
+          CS.BgImage := ''
+        else if StrIn(VL, ['repeat', 'repeat-x', 'repeat-y', 'no-repeat']) then
+          SetBgRepeat(VL)
+        else if (VL = 'fixed') or (VL = 'scroll') or (VL = 'local') then
+          CS.BgFixed := VL = 'fixed'
         else if ParseCssColor(Tokens[I], Col) then
         begin
           CS.BgColor := Col;
           CS.HasBgColor := True;
-        end;
+        end
+        else
+          PosToks.Add(Tokens[I]);   // position words and lengths
       end;
+      if PosToks.Count > 0 then
+        SetBgPosition(PosToks);
     finally
+      PosToks.Free;
       Tokens.Free;
     end;
   end
+
+  else if Prop = 'background-attachment' then
+    CS.BgFixed := SameText(Trim(V), 'fixed')
 
   else if Prop = 'background-image' then
   begin
@@ -1390,13 +1635,7 @@ begin
   end
 
   else if Prop = 'background-repeat' then
-  begin
-    VL := LowerCase(V);
-    if VL = 'no-repeat' then
-      CS.BgRepeat := False
-    else if StrIn(VL, ['repeat', 'repeat-x', 'repeat-y']) then
-      CS.BgRepeat := True;
-  end
+    SetBgRepeat(LowerCase(Trim(V)))
 
   else if Prop = 'background-size' then
   begin
@@ -1427,30 +1666,7 @@ begin
     Tokens := TStringList.Create;
     try
       SplitValueTokens(V, Tokens);
-      if Tokens.Count >= 1 then
-      begin
-        LK := ParseLength(Tokens[0], CS.FontSizePx, Px, Pct);
-        if LK = lkPct then
-          CS.BgPosXPct := Pct
-        else if SameText(Tokens[0], 'center') then
-          CS.BgPosXPct := 50
-        else if SameText(Tokens[0], 'right') then
-          CS.BgPosXPct := 100
-        else if SameText(Tokens[0], 'left') then
-          CS.BgPosXPct := 0;
-      end;
-      if Tokens.Count >= 2 then
-      begin
-        LK := ParseLength(Tokens[1], CS.FontSizePx, Px, Pct);
-        if LK = lkPct then
-          CS.BgPosYPct := Pct
-        else if SameText(Tokens[1], 'center') then
-          CS.BgPosYPct := 50
-        else if SameText(Tokens[1], 'bottom') then
-          CS.BgPosYPct := 100
-        else if SameText(Tokens[1], 'top') then
-          CS.BgPosYPct := 0;
-      end;
+      SetBgPosition(Tokens);
     finally
       Tokens.Free;
     end;
@@ -1461,9 +1677,24 @@ begin
 
   else if Prop = 'font' then
   begin
-    // font shorthand: [style||variant||weight]? size[/lh] family
-    if ParseFontShorthand(V, FSizeS, FLhS, FFamS) then
+    // font shorthand: [style||variant||weight]? size[/lh] family. Like every
+    // shorthand it first resets its sub-properties to their initial values
+    // (CSS 2.1 15.8): a missing weight means normal, a missing line-height
+    // means normal
+    if ParseFontShorthand(V, FSizeS, FLhS, FFamS, FPreS) then
     begin
+      CS.Bold := False;
+      CS.Italic := False;
+      CS.LineHeight := 1.25;
+      CS.LineHeightPx := -1;
+      CS.LineHeightNormal := True;
+      for FPreW in FPreS.Split([' ']) do
+        if FPreW <> '' then
+          if (FPreW = 'italic') or (FPreW = 'oblique') then
+            CS.Italic := True
+          else if (FPreW = 'bold') or (FPreW = 'bolder') or
+                  (StrToIntDef(FPreW, 0) >= 600) then
+            CS.Bold := True;
       if FSizeS <> '' then
         ApplyDecl(CS, 'font-size', FSizeS, ParentFontSize, Parent);
       if FLhS <> '' then
@@ -1553,16 +1784,33 @@ begin
   else if Prop = 'line-height' then
   begin
     if SameText(V, 'normal') then
-      CS.LineHeight := 1.25
+    begin
+      CS.LineHeight := 1.25;
+      CS.LineHeightPx := -1;
+      CS.LineHeightNormal := True;
+    end
     else if TryStrToFloat(V, D, FS) then
-      CS.LineHeight := D
+    begin
+      if D >= 0 then
+      begin
+        CS.LineHeight := D;
+        CS.LineHeightPx := -1;
+        CS.LineHeightNormal := False;
+      end;
+    end
     else
     begin
       LK := ParseLength(V, CS.FontSizePx, Px, Pct);
-      if (LK = lkPx) and (CS.FontSizePx > 0) then
-        CS.LineHeight := Px / CS.FontSizePx
-      else if LK = lkPct then
-        CS.LineHeight := Pct / 100;
+      if (LK = lkPx) and (Px >= 0) then
+      begin
+        CS.LineHeightPx := Px;
+        CS.LineHeightNormal := False;
+      end
+      else if (LK = lkPct) and (Pct >= 0) then
+      begin
+        CS.LineHeightPx := Round(CS.FontSizePx * Pct / 100);
+        CS.LineHeightNormal := False;
+      end;
     end;
   end
 
@@ -1980,56 +2228,34 @@ begin
     Tokens := TStringList.Create;
     try
       SplitValueTokens(V, Tokens);
-      W := 1;
-      BS := cbsSolid;
-      Col := CS.BorderColor;
-      BoolTmp := False; // whether a colour was given
+      // a shorthand resets what it does not name: width medium, style none,
+      // colour = the element's 'color'
+      W := 3;
+      BS := cbsNone;
+      Col := CS.Color;
+      BoolTmp := True; // the whole declaration is valid
+      // (temporaries: a failed parse must not overwrite a value already found)
       for I := 0 to Tokens.Count - 1 do
-      begin
         if ParseBorderStyleWord(Tokens[I], BS) then
-          Continue;
-        if ParseCssColor(Tokens[I], Col) then
-        begin
-          BoolTmp := True;
-          Continue;
-        end;
-        VL := LowerCase(Tokens[I]);
-        if VL = 'thin' then
-          W := 1
-        else if VL = 'medium' then
-          W := 3
-        else if VL = 'thick' then
-          W := 5
-        else if ParseLength(Tokens[I], CS.FontSizePx, Px, Pct) = lkPx then
-          W := Px;
-      end;
-      if BS = cbsNone then
-        W := 0;
-      CS.BorderStyle := BS;
-      if Prop = 'border' then
+          Continue
+        else if ParseBorderColor(Tokens[I], TmpCol) then
+          Col := TmpCol
+        else if ParseBorderWidthWord(Tokens[I], TmpW) then
+          W := TmpW
+        else
+          BoolTmp := False;
+      if BoolTmp and (Tokens.Count > 0) then
       begin
-        SetAllBorderW(W);
-        if BoolTmp then SetAllBorderColor(Col);
-      end
-      else if Prop = 'border-top' then
-      begin
-        CS.BordT := W;
-        if BoolTmp then CS.BorderColorT := Col;
-      end
-      else if Prop = 'border-right' then
-      begin
-        CS.BordR := W;
-        if BoolTmp then CS.BorderColorR := Col;
-      end
-      else if Prop = 'border-bottom' then
-      begin
-        CS.BordB := W;
-        if BoolTmp then CS.BorderColorB := Col;
-      end
-      else if Prop = 'border-left' then
-      begin
-        CS.BordL := W;
-        if BoolTmp then CS.BorderColorL := Col;
+        if (Prop = 'border') or (Prop = 'border-top') then
+          begin CS.BordSpecT := W; CS.BorderStyleT := BS; CS.BorderColorT := Col; end;
+        if (Prop = 'border') or (Prop = 'border-right') then
+          begin CS.BordSpecR := W; CS.BorderStyleR := BS; CS.BorderColorR := Col; end;
+        if (Prop = 'border') or (Prop = 'border-bottom') then
+          begin CS.BordSpecB := W; CS.BorderStyleB := BS; CS.BorderColorB := Col; end;
+        if (Prop = 'border') or (Prop = 'border-left') then
+          begin CS.BordSpecL := W; CS.BorderStyleL := BS; CS.BorderColorL := Col; end;
+        if Prop = 'border' then
+          CS.BorderColor := Col;
       end;
     finally
       Tokens.Free;
@@ -2038,34 +2264,21 @@ begin
 
   else if Prop = 'border-width' then
   begin
+    // 1-4 values: top, right, bottom, left (CSS box shorthand)
     Tokens := TStringList.Create;
     try
       SplitValueTokens(V, Tokens);
-      case Tokens.Count of
-        1: if ParseLength(Tokens[0], CS.FontSizePx, Px, Pct) = lkPx then
-             SetAllBorderW(Px);
-        2: begin
-             if ParseLength(Tokens[0], CS.FontSizePx, Px, Pct) = lkPx then
-             begin
-               CS.BordT := Px;
-               CS.BordB := Px;
-             end;
-             if ParseLength(Tokens[1], CS.FontSizePx, Px, Pct) = lkPx then
-             begin
-               CS.BordL := Px;
-               CS.BordR := Px;
-             end;
-           end;
-        4: begin
-             if ParseLength(Tokens[0], CS.FontSizePx, Px, Pct) = lkPx then
-               CS.BordT := Px;
-             if ParseLength(Tokens[1], CS.FontSizePx, Px, Pct) = lkPx then
-               CS.BordR := Px;
-             if ParseLength(Tokens[2], CS.FontSizePx, Px, Pct) = lkPx then
-               CS.BordB := Px;
-             if ParseLength(Tokens[3], CS.FontSizePx, Px, Pct) = lkPx then
-               CS.BordL := Px;
-           end;
+      SetLength(BWs, Tokens.Count);
+      BoolTmp := (Tokens.Count >= 1) and (Tokens.Count <= 4);
+      for I := 0 to Tokens.Count - 1 do
+        if BoolTmp and not ParseBorderWidthWord(Tokens[I], BWs[I]) then
+          BoolTmp := False;
+      if BoolTmp then
+      begin
+        CS.BordSpecT := BWs[BoxSideIdx(Length(BWs), 0)];
+        CS.BordSpecR := BWs[BoxSideIdx(Length(BWs), 1)];
+        CS.BordSpecB := BWs[BoxSideIdx(Length(BWs), 2)];
+        CS.BordSpecL := BWs[BoxSideIdx(Length(BWs), 3)];
       end;
     finally
       Tokens.Free;
@@ -2074,15 +2287,50 @@ begin
 
   else if Prop = 'border-style' then
   begin
-    if ParseBorderStyleWord(V, BS) then
-    begin
-      CS.BorderStyle := BS;
-      if BS = cbsNone then
-        SetAllBorderW(0)
-      else if (CS.BordL = 0) and (CS.BordT = 0) and (CS.BordR = 0) and
-              (CS.BordB = 0) then
-        SetAllBorderW(3); // medium — default width
+    // 1-4 values: top, right, bottom, left
+    Tokens := TStringList.Create;
+    try
+      SplitValueTokens(V, Tokens);
+      SetLength(BSs, Tokens.Count);
+      BoolTmp := (Tokens.Count >= 1) and (Tokens.Count <= 4);
+      for I := 0 to Tokens.Count - 1 do
+        if BoolTmp and not ParseBorderStyleWord(Tokens[I], BSs[I]) then
+          BoolTmp := False;
+      if BoolTmp then
+      begin
+        CS.BorderStyleT := BSs[BoxSideIdx(Length(BSs), 0)];
+        CS.BorderStyleR := BSs[BoxSideIdx(Length(BSs), 1)];
+        CS.BorderStyleB := BSs[BoxSideIdx(Length(BSs), 2)];
+        CS.BorderStyleL := BSs[BoxSideIdx(Length(BSs), 3)];
+      end;
+    finally
+      Tokens.Free;
     end;
+  end
+
+  else if (Prop = 'border-top-width') or (Prop = 'border-right-width') or
+          (Prop = 'border-bottom-width') or (Prop = 'border-left-width') then
+  begin
+    if ParseBorderWidthWord(Trim(V), W) then
+      case Prop[8] of
+        't': CS.BordSpecT := W;
+        'r': CS.BordSpecR := W;
+        'b': CS.BordSpecB := W;
+        'l': CS.BordSpecL := W;
+      end;
+  end
+
+  else if (Prop = 'border-top-style') or (Prop = 'border-right-style') or
+          (Prop = 'border-bottom-style') or (Prop = 'border-left-style') then
+  begin
+    BS := cbsNone;
+    if ParseBorderStyleWord(Trim(V), BS) then
+      case Prop[8] of
+        't': CS.BorderStyleT := BS;
+        'r': CS.BorderStyleR := BS;
+        'b': CS.BorderStyleB := BS;
+        'l': CS.BorderStyleL := BS;
+      end;
   end
 
   else if Prop = 'border-color' then
@@ -2092,24 +2340,24 @@ begin
       SplitValueTokens(V, Tokens);
       // 1-4 values: top right bottom left (like border-width)
       case Tokens.Count of
-        1: if ParseCssColor(Tokens[0], Col) then SetAllBorderColor(Col);
+        1: if ParseBorderColor(Tokens[0], Col) then SetAllBorderColor(Col);
         2: begin
-             if ParseCssColor(Tokens[0], Col) then
+             if ParseBorderColor(Tokens[0], Col) then
                begin CS.BorderColorT := Col; CS.BorderColorB := Col; end;
-             if ParseCssColor(Tokens[1], Col) then
+             if ParseBorderColor(Tokens[1], Col) then
                begin CS.BorderColorL := Col; CS.BorderColorR := Col; end;
            end;
         3: begin
-             if ParseCssColor(Tokens[0], Col) then CS.BorderColorT := Col;
-             if ParseCssColor(Tokens[1], Col) then
+             if ParseBorderColor(Tokens[0], Col) then CS.BorderColorT := Col;
+             if ParseBorderColor(Tokens[1], Col) then
                begin CS.BorderColorL := Col; CS.BorderColorR := Col; end;
-             if ParseCssColor(Tokens[2], Col) then CS.BorderColorB := Col;
+             if ParseBorderColor(Tokens[2], Col) then CS.BorderColorB := Col;
            end;
         4: begin
-             if ParseCssColor(Tokens[0], Col) then CS.BorderColorT := Col;
-             if ParseCssColor(Tokens[1], Col) then CS.BorderColorR := Col;
-             if ParseCssColor(Tokens[2], Col) then CS.BorderColorB := Col;
-             if ParseCssColor(Tokens[3], Col) then CS.BorderColorL := Col;
+             if ParseBorderColor(Tokens[0], Col) then CS.BorderColorT := Col;
+             if ParseBorderColor(Tokens[1], Col) then CS.BorderColorR := Col;
+             if ParseBorderColor(Tokens[2], Col) then CS.BorderColorB := Col;
+             if ParseBorderColor(Tokens[3], Col) then CS.BorderColorL := Col;
            end;
       end;
       // keep BorderColor (controls) as the top edge colour
@@ -2120,13 +2368,13 @@ begin
   end
 
   else if Prop = 'border-top-color' then
-    begin if ParseCssColor(V, Col) then CS.BorderColorT := Col; end
+    begin if ParseBorderColor(V, Col) then CS.BorderColorT := Col; end
   else if Prop = 'border-right-color' then
-    begin if ParseCssColor(V, Col) then CS.BorderColorR := Col; end
+    begin if ParseBorderColor(V, Col) then CS.BorderColorR := Col; end
   else if Prop = 'border-bottom-color' then
-    begin if ParseCssColor(V, Col) then CS.BorderColorB := Col; end
+    begin if ParseBorderColor(V, Col) then CS.BorderColorB := Col; end
   else if Prop = 'border-left-color' then
-    begin if ParseCssColor(V, Col) then CS.BorderColorL := Col; end
+    begin if ParseBorderColor(V, Col) then CS.BorderColorL := Col; end
 
   else if Prop = 'visibility' then
   begin
@@ -2324,11 +2572,12 @@ begin
     N := StrToIntDef(E.GetAttribute('border'), 0);
     if N > 0 then
     begin
-      CS.BorderStyle := cbsSolid;
-      CS.BordL := N;
-      CS.BordT := N;
-      CS.BordR := N;
-      CS.BordB := N;
+      CS.BorderStyleT := cbsSolid; CS.BorderStyleR := cbsSolid;
+      CS.BorderStyleB := cbsSolid; CS.BorderStyleL := cbsSolid;
+      CS.BordSpecL := N;
+      CS.BordSpecT := N;
+      CS.BordSpecR := N;
+      CS.BordSpecB := N;
     end;
     ApplyWidthHeightAttrs(E, CS);
   end
@@ -2343,11 +2592,12 @@ begin
     begin
       if StrToIntDef(TDOMElement(Anc).GetAttribute('border'), 0) > 0 then
       begin
-        CS.BorderStyle := cbsSolid;
-        CS.BordL := 1;
-        CS.BordT := 1;
-        CS.BordR := 1;
-        CS.BordB := 1;
+        CS.BorderStyleT := cbsSolid; CS.BorderStyleR := cbsSolid;
+        CS.BorderStyleB := cbsSolid; CS.BorderStyleL := cbsSolid;
+        CS.BordSpecL := 1;
+        CS.BordSpecT := 1;
+        CS.BordSpecR := 1;
+        CS.BordSpecB := 1;
       end;
       N := StrToIntDef(TDOMElement(Anc).GetAttribute('cellpadding'), -1);
       if N >= 0 then
@@ -2538,12 +2788,25 @@ begin
     end;
 
     Entries.Sort(@CompareEntries);
+    // which origin set the vertical margins last (UA = band 0, or 5 when !important)
+    for I := 0 to Entries.Count - 1 do
+      with TDeclEntry(Entries[I]) do
+      begin
+        if (Prop = 'margin') or (Prop = 'margin-top') then
+          CS.MarginTFromUA := (Weight shr 40) in [0, 5];
+        if (Prop = 'margin') or (Prop = 'margin-bottom') then
+          CS.MarginBFromUA := (Weight shr 40) in [0, 5];
+      end;
 
     // font-size first (em units depend on it) — also the size from
     // the `font` shorthand, otherwise em dimensions would use the wrong size
     for I := 0 to Entries.Count - 1 do
       if TDeclEntry(Entries[I]).Prop = 'font-size' then
-        ApplyDecl(CS, 'font-size', TDeclEntry(Entries[I]).Value, ParentFS, Parent)
+      begin
+        if DeclValueValid('font-size', TDeclEntry(Entries[I]).Value,
+             (E.OwnerDocument <> nil) and (E.OwnerDocument.CompatMode = dcmQuirks)) then
+          ApplyDecl(CS, 'font-size', TDeclEntry(Entries[I]).Value, ParentFS, Parent);
+      end
       else if TDeclEntry(Entries[I]).Prop = 'font' then
         if ParseFontShorthand(TDeclEntry(Entries[I]).Value,
              FontSzTmp, LhTmp, FamTmp) and (FontSzTmp <> '') then
@@ -2554,7 +2817,9 @@ begin
     ApplyPresentationalAttrs(E, CS);
 
     for I := 0 to Entries.Count - 1 do
-      if TDeclEntry(Entries[I]).Prop <> 'font-size' then
+      if (TDeclEntry(Entries[I]).Prop <> 'font-size') and
+         DeclValueValid(TDeclEntry(Entries[I]).Prop, TDeclEntry(Entries[I]).Value,
+           (E.OwnerDocument <> nil) and (E.OwnerDocument.CompatMode = dcmQuirks)) then
         ApplyDecl(CS, TDeclEntry(Entries[I]).Prop,
           TDeclEntry(Entries[I]).Value, ParentFS, Parent);
   finally
@@ -2562,6 +2827,7 @@ begin
       TDeclEntry(Entries[I]).Free;
     Entries.Free;
   end;
+  CS.FinalizeBorders;
 
   // float forces block
   if (CS.Float_ <> cfNone) and (CS.Display in [cdInline, cdInlineBlock]) then
@@ -2602,15 +2868,30 @@ begin
       Exit;
     end;
     Entries.Sort(@CompareEntries);
+    // which origin set the vertical margins last (UA = band 0, or 5 when !important)
+    for I := 0 to Entries.Count - 1 do
+      with TDeclEntry(Entries[I]) do
+      begin
+        if (Prop = 'margin') or (Prop = 'margin-top') then
+          CS.MarginTFromUA := (Weight shr 40) in [0, 5];
+        if (Prop = 'margin') or (Prop = 'margin-bottom') then
+          CS.MarginBFromUA := (Weight shr 40) in [0, 5];
+      end;
     for I := 0 to Entries.Count - 1 do
       if TDeclEntry(Entries[I]).Prop = 'font-size' then
-        ApplyDecl(CS, 'font-size', TDeclEntry(Entries[I]).Value, ParentFS, Parent)
+      begin
+        if DeclValueValid('font-size', TDeclEntry(Entries[I]).Value,
+             (E.OwnerDocument <> nil) and (E.OwnerDocument.CompatMode = dcmQuirks)) then
+          ApplyDecl(CS, 'font-size', TDeclEntry(Entries[I]).Value, ParentFS, Parent);
+      end
       else if TDeclEntry(Entries[I]).Prop = 'font' then
         if ParseFontShorthand(TDeclEntry(Entries[I]).Value,
              FontSzTmp, LhTmp, FamTmp) and (FontSzTmp <> '') then
           ApplyDecl(CS, 'font-size', FontSzTmp, ParentFS, Parent);
     for I := 0 to Entries.Count - 1 do
-      if TDeclEntry(Entries[I]).Prop <> 'font-size' then
+      if (TDeclEntry(Entries[I]).Prop <> 'font-size') and
+         DeclValueValid(TDeclEntry(Entries[I]).Prop, TDeclEntry(Entries[I]).Value,
+           (E.OwnerDocument <> nil) and (E.OwnerDocument.CompatMode = dcmQuirks)) then
         ApplyDecl(CS, TDeclEntry(Entries[I]).Prop,
           TDeclEntry(Entries[I]).Value, ParentFS, Parent);
   finally
@@ -2618,6 +2899,7 @@ begin
       TDeclEntry(Entries[I]).Free;
     Entries.Free;
   end;
+  CS.FinalizeBorders;
 
   if (CS.Float_ <> cfNone) and (CS.Display in [cdInline, cdInlineBlock]) then
     CS.Display := cdBlock;

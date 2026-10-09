@@ -20,6 +20,9 @@ uses
 
 type
   TDomNodeType = (ntDocument, ntElement, ntText, ntComment);
+  // document mode from the DOCTYPE (HTML spec "quirks mode"): layout differs
+  // in details, e.g. the line-height strut is not applied in quirks mode
+  TDocCompatMode = (dcmQuirks, dcmLimitedQuirks, dcmStandards);
 
   TDOMDocument = class;
   TDOMElement = class;
@@ -122,6 +125,7 @@ type
     FBaseUrl: string;
     FTitle: string;
   public
+    CompatMode: TDocCompatMode; // set by the parser; quirks without a DOCTYPE
     constructor Create;
     destructor Destroy; override;
 

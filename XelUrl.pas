@@ -15,11 +15,18 @@ function ResolveUrl(const Base, Rel: string): string;
 function IsHttpUrl(const S: string): Boolean;
 function IsHttpsUrl(const S: string): Boolean;
 function StripFragment(const S: string): string;
+// file:// URL -> local path: 'file:///C:/a/b' -> 'C:\a\b' on Windows,
+// 'file:///a/b' -> '/a/b' elsewhere. Other strings are returned unchanged.
+function FileUrlToPath(const Url: string): string;
+// data: URL -> its bytes (percent-decoded, then base64-decoded when marked
+// ';base64'). MimeType is lower case, e.g. 'image/png'. False if not a data: URL.
+function DecodeDataUrl(const Url: string; out Data: RawByteString;
+  out MimeType: string): Boolean;
 
 implementation
 
 uses
-  SysUtils;
+  SysUtils, base64;
 
 function IsHttpUrl(const S: string): Boolean;
 begin
@@ -40,6 +47,57 @@ begin
     Result := Copy(S, 1, I - 1)
   else
     Result := S;
+end;
+
+function FileUrlToPath(const Url: string): string;
+begin
+  Result := Url;
+  if not SameText(Copy(Result, 1, 7), 'file://') then
+    Exit;
+  Result := Copy(Result, 8, MaxInt);  // '/C:/a' or '/a/b' (file:///), 'C:/a' (file://C:/a)
+  {$IFDEF MSWINDOWS}
+  if (Result <> '') and (Result[1] = '/') then
+    Delete(Result, 1, 1);
+  {$ENDIF}
+  Result := StringReplace(Result, '/', PathDelim, [rfReplaceAll]);
+end;
+
+function DecodeDataUrl(const Url: string; out Data: RawByteString;
+  out MimeType: string): Boolean;
+var
+  P, I: Integer;
+  Meta, Payload: string;
+begin
+  Data := '';
+  MimeType := '';
+  Result := SameText(Copy(Url, 1, 5), 'data:');
+  if not Result then Exit;
+  P := Pos(',', Url);
+  if P = 0 then Exit(False);
+  Meta := LowerCase(Copy(Url, 6, P - 6));
+  Payload := Copy(Url, P + 1, MaxInt);
+  MimeType := Trim(Copy(Meta, 1, Pos(';', Meta + ';') - 1));
+  // percent-decode first (Acid2 encodes '/', '+', '=' even inside base64)
+  SetLength(Data, Length(Payload));
+  P := 0;
+  I := 1;
+  while I <= Length(Payload) do
+  begin
+    Inc(P);
+    if (Payload[I] = '%') and (I + 2 <= Length(Payload)) then
+    begin
+      Data[P] := AnsiChar(StrToIntDef('$' + Copy(Payload, I + 1, 2), 32));
+      Inc(I, 3);
+    end
+    else
+    begin
+      Data[P] := AnsiChar(Payload[I]);
+      Inc(I);
+    end;
+  end;
+  SetLength(Data, P);
+  if Pos(';base64', Meta) > 0 then
+    Data := DecodeStringBase64(Data);
 end;
 
 // Whether the string starts with a scheme, e.g. "http:", "data:", "mailto:"
@@ -192,8 +250,8 @@ begin
   else
   begin
     // Local base — a file on disk
-    R := StringReplace(R, '/', '\', [rfReplaceAll]);
-    if (R <> '') and (R[1] = '\') then
+    R := StringReplace(R, '/', PathDelim, [rfReplaceAll]);
+    if (R <> '') and (R[1] = PathDelim) then
       Result := ExtractFileDrive(Base) + R
     else
       Result := ExpandFileName(ExtractFilePath(Base) + R);

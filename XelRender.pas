@@ -12,7 +12,8 @@ unit XelRender;
 interface
 
 uses
-  Classes, SysUtils, Math, Graphics, Windows, Types,
+  Classes, SysUtils, Math, Graphics,
+  {$IFDEF MSWINDOWS}Windows,{$ELSE}LCLType, LCLIntf,{$ENDIF} Types,
   Generics.Collections, IntfGraphics, FPImage,
   XelLayout, XelStyle, XelDom, XelTextUtil, XelUrl, OTF, XelImageScale, XelSvgImage,
   XelForms, LazUTF8;
@@ -65,13 +66,22 @@ type
     procedure DrawBoxShadow(St: TComputedStyle; const R: TRect);
     // paints the box content as a separate stacking context (its own float pass)
     procedure PaintContentWithFloats(Box: TLayoutBox; const R: TRect);
+    // paints Box as one layer, in the order of CSS 2.1 Appendix E
+    procedure PaintLayer(Box: TLayoutBox; const R: TRect; ContentOnly: Boolean);
+    procedure DrawInlineDecos(Line: TLineBox);
   private
-    // Floats are painted AFTER all in-flow blocks of the given context
-    // (CSS 2.1 App. E), also above blocks from LATER sections — that is why
-    // we defer them to a separate pass. Without it e.g. an infobox (float:right
-    // from section 0) would not cover the heading border from section 1.
+    // CSS 2.1 Appendix E: within a stacking context (and within a float or a
+    // positioned box, which paint atomically) the backgrounds and borders of
+    // the in-flow blocks come first, then the floats, then the inline content
+    // (text, images), then the positioned descendants. While FDeferFloats is
+    // set, DrawBoxContent only paints backgrounds and collects the rest; this
+    // way e.g. an infobox (float:right from section 0) covers the heading
+    // border from section 1, and text paints above a float next to it.
     FDeferFloats: Boolean;
     FDeferredFloats: Classes.TList;
+    FDeferredInlines: Classes.TList;   // boxes whose line boxes are pending
+    FDeferredPos: Classes.TList;       // positioned boxes (painted last)
+    FClipDepth: Integer;               // inside overflow clipping: no deferral
   end;
 
 // clears the cache of scaled images (call when the document changes)
@@ -82,27 +92,81 @@ implementation
 // TRenderer
 
 procedure TRenderer.Paint(Root: TLayoutBox);
-var
-  I: Integer;
-  SavedList: Classes.TList;
-  SavedDefer: Boolean;
 begin
   if Root = nil then
     Exit;
-  // stacking context: collect floats during the traversal, draw them after the blocks
-  SavedList := FDeferredFloats;
+  FClipDepth := 0;
+  PaintLayer(Root, Rect(0, 0, 0, 0), False);
+end;
+
+// Paints Box (DrawBox, or only its content into R when ContentOnly) as one
+// layer: backgrounds/borders of its in-flow blocks, then its floats, then the
+// inline content, then its positioned descendants by z-index (CSS 2.1 App. E).
+procedure TRenderer.PaintLayer(Box: TLayoutBox; const R: TRect; ContentOnly: Boolean);
+var
+  SavedF, SavedI, SavedP: Classes.TList;
+  SavedDefer: Boolean;
+  SavedOX, SavedOY, K, J, M: Integer;
+  B: TLayoutBox;
+  IsFixed: Boolean;
+begin
+  SavedF := FDeferredFloats;
+  SavedI := FDeferredInlines;
+  SavedP := FDeferredPos;
   SavedDefer := FDeferFloats;
+  SavedOX := OffsetX;
+  SavedOY := OffsetY;
+  // a fixed box and everything collected inside it is drawn without scrolling
+  IsFixed := (not ContentOnly) and (Box.Style.Position = cpFixed);
+  if IsFixed then
+  begin
+    OffsetX := 0;
+    OffsetY := 0;
+  end;
   FDeferredFloats := Classes.TList.Create;
+  FDeferredInlines := Classes.TList.Create;
+  FDeferredPos := Classes.TList.Create;
   FDeferFloats := True;
   try
-    DrawBox(Root);
-    FDeferFloats := False; // in the float pass draw them normally
-    for I := 0 to FDeferredFloats.Count - 1 do
-      DrawBox(TLayoutBox(FDeferredFloats[I]));
+    if ContentOnly then
+      DrawBoxContent(Box, R)
+    else
+      DrawBox(Box);
+    FDeferFloats := False;
+    // floats, each as its own layer
+    for K := 0 to FDeferredFloats.Count - 1 do
+      PaintLayer(TLayoutBox(FDeferredFloats[K]), Rect(0, 0, 0, 0), False);
+    // inline content of the in-flow blocks
+    for K := 0 to FDeferredInlines.Count - 1 do
+    begin
+      B := TLayoutBox(FDeferredInlines[K]);
+      for J := 0 to B.Lines.Count - 1 do
+        DrawLine(B, B.Lines[J]);
+    end;
+    // positioned descendants: stable order by z-index
+    for K := 1 to FDeferredPos.Count - 1 do
+    begin
+      B := TLayoutBox(FDeferredPos[K]);
+      M := K - 1;
+      while (M >= 0) and (TLayoutBox(FDeferredPos[M]).Style.ZIndex > B.Style.ZIndex) do
+      begin
+        FDeferredPos[M + 1] := FDeferredPos[M];
+        Dec(M);
+      end;
+      FDeferredPos[M + 1] := B;
+    end;
+    for K := 0 to FDeferredPos.Count - 1 do
+      PaintLayer(TLayoutBox(FDeferredPos[K]), Rect(0, 0, 0, 0), False);
   finally
     FDeferredFloats.Free;
-    FDeferredFloats := SavedList;
+    FDeferredInlines.Free;
+    FDeferredPos.Free;
+    FDeferredFloats := SavedF;
+    FDeferredInlines := SavedI;
+    FDeferredPos := SavedP;
     FDeferFloats := SavedDefer;
+    OffsetX := SavedOX;
+    OffsetY := SavedOY;
   end;
 end;
 
@@ -311,9 +375,10 @@ end;
 procedure TRenderer.DrawBackground(Box: TLayoutBox; const R: TRect);
 var
   Pic: TPicture;
-  X, Y, EW, EH: Integer;
+  X, Y, EW, EH, X0, OX, OY: Integer;
   GW, GH: Integer;
-  DR: TRect;
+  PA: TRect;
+  St: TComputedStyle;
 begin
   if Box.Style.GradKind <> gkNone then
     PaintGradient(Canvas, R, Box.Style);
@@ -336,38 +401,54 @@ begin
     Pic := OnGetPicture(Box.Style.BgImage);
     if (Pic <> nil) and (Pic.Graphic <> nil) and not Pic.Graphic.Empty then
     begin
+      St := Box.Style;
       GW := Pic.Width;
       GH := Pic.Height;
-      if Box.Style.BgSizeW > 0 then
-        GW := Box.Style.BgSizeW;
-      if Box.Style.BgSizeH > 0 then
-        GH := Box.Style.BgSizeH;
+      if St.BgSizeW > 0 then
+        GW := St.BgSizeW;
+      if St.BgSizeH > 0 then
+        GH := St.BgSizeH;
       if (GW > 0) and (GH > 0) then
       begin
-        // tiling within the box
-        if Box.Style.BgRepeat then
-          Y := R.Top
+        // positioning area (CSS 2.1 14.2.1): the padding box, or the
+        // viewport for background-attachment: fixed (the canvas is the
+        // viewport, so its origin is 0,0)
+        if St.BgFixed then
+          PA := Rect(0, 0, ViewWidth, ViewHeight)
         else
-          Y := R.Top + Round(((R.Bottom - R.Top) - GH) *
-            Box.Style.BgPosYPct / 100);
-        while Y < R.Bottom do
-        begin
-          if Box.Style.BgRepeat then
-            X := R.Left
-          else
-            X := R.Left + Round(((R.Right - R.Left) - GW) *
-              Box.Style.BgPosXPct / 100);
-          while X < R.Right do
+          PA := Rect(R.Left + St.BordL, R.Top + St.BordT,
+            R.Right - St.BordR, R.Bottom - St.BordB);
+        OX := PA.Left + Round(((PA.Right - PA.Left) - GW) * St.BgPosXPct / 100) + St.BgPosXPx;
+        OY := PA.Top + Round(((PA.Bottom - PA.Top) - GH) * St.BgPosYPct / 100) + St.BgPosYPx;
+        // tiles cover the border box; the first tile starts at or before its edge
+        if St.BgRepeatX then
+          X0 := OX - ((OX - R.Left + GW - 1) div GW) * GW
+        else
+          X0 := OX;
+        if St.BgRepeatY then
+          Y := OY - ((OY - R.Top + GH - 1) div GH) * GH
+        else
+          Y := OY;
+        Canvas.SaveHandleState; // (not raw SaveDC: keeps TCanvas and DC in sync)
+        IntersectClipRect(Canvas.Handle, R.Left, R.Top, R.Right, R.Bottom);
+        try
+          while Y < R.Bottom do
           begin
-            DR := Rect(X, Y, X + GW, Y + GH);
-            DrawImageNice(DR, Pic);
-            Inc(X, GW);
-            if not Box.Style.BgRepeat then
+            X := X0;
+            while X < R.Right do
+            begin
+              if (X + GW > R.Left) and (Y + GH > R.Top) then
+                DrawImageNice(Rect(X, Y, X + GW, Y + GH), Pic);
+              Inc(X, GW);
+              if not St.BgRepeatX then
+                Break;
+            end;
+            Inc(Y, GH);
+            if not St.BgRepeatY then
               Break;
           end;
-          Inc(Y, GH);
-          if not Box.Style.BgRepeat then
-            Break;
+        finally
+          Canvas.RestoreHandleState;
         end;
       end;
     end;
@@ -378,6 +459,20 @@ procedure TRenderer.DrawBorders(Box: TLayoutBox; const R: TRect);
 var
   St: TComputedStyle;
   EW, EH: Integer;
+  Inner: TRect;
+  Done: array[0..3] of Boolean; // top, bottom, left, right already drawn
+
+  // one solid side as a filled polygon (no outline)
+  procedure Side(Color: TColor; const Pts: array of TPoint);
+  begin
+    if Color = clNone then
+      Exit;
+    Canvas.Brush.Style := bsSolid;
+    Canvas.Brush.Color := Color;
+    Canvas.Pen.Style := psClear;
+    Canvas.Polygon(Pts);
+    Canvas.Pen.Style := psSolid;
+  end;
 
   procedure EdgeDashed(const ER: TRect; Horizontal: Boolean; Dot: Boolean);
   var
@@ -428,11 +523,14 @@ var
     end;
   end;
 
-  procedure DrawEdge(const ER: TRect; Horizontal: Boolean; Color: TColor);
+  procedure DrawEdge(const ER: TRect; Horizontal: Boolean; Color: TColor;
+    BS: TCssBorderStyle);
   begin
+    if (Color = clNone) or (BS = cbsNone) then
+      Exit; // transparent or no border on this side
     Canvas.Brush.Style := bsSolid;
     Canvas.Brush.Color := Color;
-    case St.BorderStyle of
+    case BS of
       cbsDashed: EdgeDashed(ER, Horizontal, False);
       cbsDotted: EdgeDashed(ER, Horizontal, True);
       cbsDouble: EdgeDouble(ER, Horizontal);
@@ -443,8 +541,9 @@ var
 
 begin
   St := Box.Style;
-  if (St.BorderStyle = cbsNone) then
+  if (St.BordT = 0) and (St.BordR = 0) and (St.BordB = 0) and (St.BordL = 0) then
     Exit;
+  FillChar(Done, SizeOf(Done), 0);
   if GetCornerEllipse(St, R.Right - R.Left, R.Bottom - R.Top, EW, EH) then
   begin
     // rounded — single colour, outline with the pen
@@ -460,15 +559,48 @@ begin
     Canvas.Pen.Width := 1;
     Exit;
   end;
-  // each edge with its own colour and style
-  if St.BordT > 0 then
-    DrawEdge(Rect(R.Left, R.Top, R.Right, R.Top + St.BordT), True, St.BorderColorT);
-  if St.BordB > 0 then
-    DrawEdge(Rect(R.Left, R.Bottom - St.BordB, R.Right, R.Bottom), True, St.BorderColorB);
-  if St.BordL > 0 then
-    DrawEdge(Rect(R.Left, R.Top, R.Left + St.BordL, R.Bottom), False, St.BorderColorL);
-  if St.BordR > 0 then
-    DrawEdge(Rect(R.Right - St.BordR, R.Top, R.Right, R.Bottom), False, St.BorderColorR);
+  // sides of different colours meet diagonally at the corners (CSS 2.1 8.5.3):
+  // solid sides are drawn as trapezoids — e.g. Acid2's nose is a diamond made
+  // of the borders of two empty boxes
+  if not ((St.BorderColorT = St.BorderColorR) and (St.BorderColorT = St.BorderColorB) and
+          (St.BorderColorT = St.BorderColorL)) then
+  begin
+    Inner := Rect(R.Left + St.BordL, R.Top + St.BordT, R.Right - St.BordR,
+      R.Bottom - St.BordB);
+    if (St.BordT > 0) and (St.BorderStyleT = cbsSolid) then
+    begin
+      Side(St.BorderColorT, [Point(R.Left, R.Top), Point(R.Right, R.Top),
+        Point(Inner.Right, Inner.Top), Point(Inner.Left, Inner.Top)]);
+      Done[0] := True;
+    end;
+    if (St.BordB > 0) and (St.BorderStyleB = cbsSolid) then
+    begin
+      Side(St.BorderColorB, [Point(R.Left, R.Bottom), Point(R.Right, R.Bottom),
+        Point(Inner.Right, Inner.Bottom), Point(Inner.Left, Inner.Bottom)]);
+      Done[1] := True;
+    end;
+    if (St.BordL > 0) and (St.BorderStyleL = cbsSolid) then
+    begin
+      Side(St.BorderColorL, [Point(R.Left, R.Top), Point(Inner.Left, Inner.Top),
+        Point(Inner.Left, Inner.Bottom), Point(R.Left, R.Bottom)]);
+      Done[2] := True;
+    end;
+    if (St.BordR > 0) and (St.BorderStyleR = cbsSolid) then
+    begin
+      Side(St.BorderColorR, [Point(R.Right, R.Top), Point(Inner.Right, Inner.Top),
+        Point(Inner.Right, Inner.Bottom), Point(R.Right, R.Bottom)]);
+      Done[3] := True;
+    end;
+  end;
+  // each remaining edge with its own colour and style
+  if (St.BordT > 0) and not Done[0] then
+    DrawEdge(Rect(R.Left, R.Top, R.Right, R.Top + St.BordT), True, St.BorderColorT, St.BorderStyleT);
+  if (St.BordB > 0) and not Done[1] then
+    DrawEdge(Rect(R.Left, R.Bottom - St.BordB, R.Right, R.Bottom), True, St.BorderColorB, St.BorderStyleB);
+  if (St.BordL > 0) and not Done[2] then
+    DrawEdge(Rect(R.Left, R.Top, R.Left + St.BordL, R.Bottom), False, St.BorderColorL, St.BorderStyleL);
+  if (St.BordR > 0) and not Done[3] then
+    DrawEdge(Rect(R.Right - St.BordR, R.Top, R.Right, R.Bottom), False, St.BorderColorR, St.BorderStyleR);
 end;
 
 procedure TRenderer.DrawImagePlaceholder(const R: TRect; const AltText: string);
@@ -496,6 +628,7 @@ var
   E: TArgbEntry;
   DW, DH: Integer;
   OK: Boolean;
+  Rgn: HRGN;
 begin
   if (G = nil) or G.Empty then
     Exit;
@@ -513,7 +646,20 @@ begin
     if OK then
       Exit;
   end;
-  Canvas.StretchDraw(R, G);   // fallback when GDI+ is unavailable
+  // fallback when GDI+ is unavailable (always outside Windows): rounded
+  // corners become a clip region (no anti-aliasing), ANDed with the current clip
+  if (RadX > 0) or (RadY > 0) then
+  begin
+    Canvas.SaveHandleState;
+    Rgn := CreateRoundRectRgn(R.Left, R.Top, R.Right + 1, R.Bottom + 1,
+      2 * RadX, 2 * RadY);
+    ExtSelectClipRgn(Canvas.Handle, Rgn, RGN_AND);
+    Canvas.StretchDraw(R, G);
+    Canvas.RestoreHandleState;
+    DeleteObject(Rgn);
+  end
+  else
+    Canvas.StretchDraw(R, G);
 end;
 
 procedure TRenderer.DrawImageNice(const R: TRect; Pic: TPicture;
@@ -558,16 +704,46 @@ var
   TM: TTextMetric;
   Ascent: Integer;
 
+  {$IFNDEF MSWINDOWS}
+  // letter-spacing without SetTextCharacterExtra: every character is drawn at
+  // the width of the text before it plus LetterSpacing per preceding character,
+  // so the total matches the layout's TextWidth + LetterSpacing * CountGlyphs
+  procedure DrawSpaced(PX, PYTop: Integer);
+  var
+    I, N, Len: Integer;
+  begin
+    I := 1;
+    N := 0;
+    while I <= Length(Text) do
+    begin
+      Len := 1;
+      while (I + Len <= Length(Text)) and ((Ord(Text[I + Len]) and $C0) = $80) do
+        Inc(Len);
+      Canvas.TextOut(PX + Canvas.TextWidth(Copy(Text, 1, I - 1)) +
+        N * St.LetterSpacing, PYTop, Copy(Text, I, Len));
+      Inc(I, Len);
+      Inc(N);
+    end;
+  end;
+  {$ENDIF}
+
   // a single drawing pass in the given colour and position
   procedure DrawPass(PX, PYTop: Integer; AColor: TColor);
   begin
     if St.LetterSpacing <> 0 then
     begin
-      // letter-spacing: GDI honours SetTextCharacterExtra (consistent with measurement)
       Canvas.Font.Color := AColor;
+      {$IFDEF MSWINDOWS}
+      // letter-spacing: GDI honours SetTextCharacterExtra (consistent with measurement);
+      // the text background stays transparent whatever brush is left selected
+      Canvas.Brush.Style := bsClear;
+      SetBkMode(Canvas.Handle, TRANSPARENT);
       SetTextCharacterExtra(Canvas.Handle, St.LetterSpacing);
       Canvas.TextOut(PX, PYTop, Text);
       SetTextCharacterExtra(Canvas.Handle, 0);
+      {$ELSE}
+      DrawSpaced(PX, PYTop);
+      {$ENDIF}
     end
     else if not DrawTextGdiPlus(Canvas.Handle, Engine.MapFontName(St.FontFamily),
          St.FontSizePx, St.Bold, St.Italic, LongWord(AColor),
@@ -585,6 +761,7 @@ begin
   // layout measured) and a possible fallback
   Engine.SetCanvasFont(Canvas, St);
   Canvas.Brush.Style := bsClear;
+  SetBkMode(Canvas.Handle, TRANSPARENT); // text never paints a background box
   if GetTextMetrics(Canvas.Handle, TM) then
     Ascent := TM.tmAscent
   else
@@ -847,12 +1024,84 @@ begin
   end;
 end;
 
+// Backgrounds and borders of inline elements (CSS 2.1 10.8, 14.2): per line,
+// one box spanning the element's fragments, as tall as its font plus vertical
+// padding and border; the left border only where the element starts, the
+// right one only where it ends. Painted behind the text, outer elements first.
+procedure TRenderer.DrawInlineDecos(Line: TLineBox);
+var
+  I, J, K, D, Base, L, Rt, Top, Bot: Integer;
+  Seen: array of TDOMElement;
+  E: TDOMElement;
+  St: TComputedStyle;
+  F: TLineFrag;
+  TM: TTextMetric;
+  HasStart, HasEnd, Found: Boolean;
+begin
+  Seen := nil;
+  for I := 0 to Line.Frags.Count - 1 do
+    for D := 0 to High(Line.Frags[I].Decos) do
+    begin
+      E := Line.Frags[I].Decos[D].Element;
+      Found := False;
+      for K := 0 to High(Seen) do
+        if Seen[K] = E then Found := True;
+      if Found then
+        Continue;
+      SetLength(Seen, Length(Seen) + 1);
+      Seen[High(Seen)] := E;
+      St := Line.Frags[I].Decos[D].Style;
+      L := MaxInt; Rt := -MaxInt; Base := Low(Integer);
+      HasStart := False; HasEnd := False;
+      for J := I to Line.Frags.Count - 1 do
+      begin
+        F := Line.Frags[J];
+        Found := False;
+        for K := 0 to High(F.Decos) do
+          if F.Decos[K].Element = E then Found := True;
+        if not Found then
+          Continue;
+        L := Min(L, F.R.Left);
+        Rt := Max(Rt, F.R.Right);
+        if (Base = Low(Integer)) and (F.Kind = fkText) then
+          Base := F.R.Top + F.Ascent;   // the line's baseline
+        if F.DecoStart = E then HasStart := True;
+        if F.DecoEnd = E then HasEnd := True;
+      end;
+      if (L > Rt) or (Base = Low(Integer)) then
+        Continue;
+      Engine.SetCanvasFont(Canvas, St);
+      if not GetTextMetrics(Canvas.Handle, TM) then
+        Continue;
+      Top := Base - TM.tmAscent - St.PadT - St.BordT - OffsetY;
+      Bot := Base + TM.tmDescent + St.PadB + St.BordB - OffsetY;
+      Dec(L, OffsetX);
+      Dec(Rt, OffsetX);
+      Canvas.Brush.Style := bsSolid;
+      if St.HasBgColor then
+      begin
+        Canvas.Brush.Color := St.BgColor;
+        Canvas.FillRect(Rect(L, Top, Rt, Bot));
+      end;
+      // borders (drawn solid)
+      if (St.BordT > 0) and (St.BorderColorT <> clNone) then
+      begin Canvas.Brush.Color := St.BorderColorT; Canvas.FillRect(Rect(L, Top, Rt, Top + St.BordT)); end;
+      if (St.BordB > 0) and (St.BorderColorB <> clNone) then
+      begin Canvas.Brush.Color := St.BorderColorB; Canvas.FillRect(Rect(L, Bot - St.BordB, Rt, Bot)); end;
+      if HasStart and (St.BordL > 0) and (St.BorderColorL <> clNone) then
+      begin Canvas.Brush.Color := St.BorderColorL; Canvas.FillRect(Rect(L, Top, L + St.BordL, Bot)); end;
+      if HasEnd and (St.BordR > 0) and (St.BorderColorR <> clNone) then
+      begin Canvas.Brush.Color := St.BorderColorR; Canvas.FillRect(Rect(Rt - St.BordR, Top, Rt, Bot)); end;
+    end;
+end;
+
 procedure TRenderer.DrawLine(Box: TLayoutBox; Line: TLineBox);
 var
   I: Integer;
 begin
   if (Line.Y + Line.H - OffsetY < 0) or (Line.Y - OffsetY > ViewHeight) then
     Exit;
+  DrawInlineDecos(Line);
   for I := 0 to Line.Frags.Count - 1 do
     DrawFrag(Line.Frags[I]);
 end;
@@ -929,7 +1178,7 @@ end;
 
 procedure TRenderer.DrawBoxContent(Box: TLayoutBox; const R: TRect);
 var
-  I, J, SavedDC, EW, EH: Integer;
+  I, J, EW, EH: Integer;
   MarkerW, MarkerX, MarkerY, IW, IH: Integer;
   ClipContent, HasMarkerImg: Boolean;
   Sorted: Classes.TList;
@@ -947,8 +1196,7 @@ begin
 
   // block image (display:block/inline-block as a box) — draw it;
   // inline images are drawn by DrawFrag, but a boxed <img> has no fragment
-  if (not Box.IsAnonymous) and (Box.Element <> nil) and
-     (Box.Element.TagName = 'img') then
+  if (not Box.IsAnonymous) and IsImageElement(Box.Element) then
   begin
     CR := Rect(R.Left + Box.Style.BordL + Box.Style.PadL,
                R.Top + Box.Style.BordT + Box.Style.PadT,
@@ -957,7 +1205,7 @@ begin
     Url := '';
     if Box.Element.OwnerDocument <> nil then
       Url := XelUrl.ResolveUrl(Box.Element.OwnerDocument.BaseUrl,
-        Box.Element.GetAttribute('src'));
+        ImageSourceAttr(Box.Element));
     if GetCornerEllipse(Box.Style, CR.Right - CR.Left, CR.Bottom - CR.Top,
          EW, EH) then
     begin EW := EW div 2; EH := EH div 2; end
@@ -979,15 +1227,26 @@ begin
 
   ClipContent := (Box.Style.OverflowX <> coVisible) or
     (Box.Style.OverflowY <> coVisible);
-  SavedDC := 0;
+  // overflow on the root element (or on <body> when the root's is visible)
+  // applies to the viewport, not to the box itself (CSS 2.1 11.1.1)
+  if ClipContent and (Box.Element <> nil) and
+     ((Box.Element.TagName = 'html') or
+      ((Box.Element.TagName = 'body') and (Box.Element.ParentNode is TDOMElement) and
+       (Engine.Root <> nil) and (Engine.Root.Style.OverflowX = coVisible) and
+       (Engine.Root.Style.OverflowY = coVisible))) then
+    ClipContent := False;
   if ClipContent then
   begin
-    SavedDC := Windows.SaveDC(Canvas.Handle);
-    Windows.IntersectClipRect(Canvas.Handle, R.Left, R.Top, R.Right, R.Bottom);
+    Canvas.SaveHandleState;
+    IntersectClipRect(Canvas.Handle, R.Left, R.Top, R.Right, R.Bottom);
+    Inc(FClipDepth); // content must stay inside: paint it now, in tree order
   end;
 
   // list marker: image (list-style-image) or bullet/number
-  if (Box.BulletText <> '') or (Box.Style.ListImage <> '') then
+  // list-style-image is inherited, so the <ul>/<ol> carries it too: only a
+  // list item (the box that got BulletText) draws a marker
+  if (Box.BulletText <> '') or
+     ((Box.Style.ListImage <> '') and (Box.Style.Display = cdListItem)) then
   begin
     MarkerY := R.Top + Box.Style.BordT + Box.Style.PadT;
     HasMarkerImg := False;
@@ -1026,8 +1285,15 @@ begin
     end;
   end;
 
-  for I := 0 to Box.Lines.Count - 1 do
-    DrawLine(Box, Box.Lines[I]);
+  // inline content paints above the floats of the layer: collect it
+  if FDeferFloats and (FClipDepth = 0) then
+  begin
+    if Box.Lines.Count > 0 then
+      FDeferredInlines.Add(Box);
+  end
+  else
+    for I := 0 to Box.Lines.Count - 1 do
+      DrawLine(Box, Box.Lines[I]);
 
   Sorted := Classes.TList.Create;
   try
@@ -1053,7 +1319,12 @@ begin
       Child := TLayoutBox(Sorted[I]);
       // in-flow float -> defer to the float pass (painted after the blocks
       // of the whole stacking context, including later sections)
-      if FDeferFloats and (Child.Style.Float_ <> cfNone) and
+      // positioned boxes, and boxes with opacity < 1 (a stacking context
+      // painted like a positioned box, CSS 3 Color 3.2): painted last
+      if FDeferFloats and (FClipDepth = 0) and ((Child.Style.Position <> cpStatic) or
+         ((Child.Style.Opacity < 1.0) and not Child.IsAnonymous)) then
+        FDeferredPos.Add(Child)
+      else if FDeferFloats and (Child.Style.Float_ <> cfNone) and
          (Child.Style.Position = cpStatic) then
         FDeferredFloats.Add(Child)
       else
@@ -1064,9 +1335,13 @@ begin
   end;
 
   if ClipContent then
-    Windows.RestoreDC(Canvas.Handle, SavedDC);
+  begin
+    Dec(FClipDepth);
+    Canvas.RestoreHandleState;
+  end;
 end;
 
+{$IFDEF MSWINDOWS}
 type
   TBlendFunc = packed record
     BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat: Byte;
@@ -1075,27 +1350,40 @@ type
 function MsAlphaBlend(hdcDest: HDC; xD, yD, wD, hD: Integer; hdcSrc: HDC;
   xS, yS, wS, hS: Integer; bf: TBlendFunc): LongBool; stdcall;
   external 'msimg32.dll' name 'AlphaBlend';
+{$ELSE}
+// Portable stand-in for AlphaBlend with a constant alpha:
+// Bg := Bg + (Fg - Bg) * Alpha / 255, pixel by pixel.
+procedure BlendBitmaps(Bg, Fg: Graphics.TBitmap; Alpha: Integer);
+var
+  BI, FI: TLazIntfImage;
+  X, Y: Integer;
+  B, F: TFPColor;
+begin
+  BI := Bg.CreateIntfImage;
+  FI := Fg.CreateIntfImage;
+  try
+    for Y := 0 to Min(BI.Height, FI.Height) - 1 do
+      for X := 0 to Min(BI.Width, FI.Width) - 1 do
+      begin
+        B := BI.Colors[X, Y];
+        F := FI.Colors[X, Y];
+        B.Red := B.Red + (Integer(F.Red) - Integer(B.Red)) * Alpha div 255;
+        B.Green := B.Green + (Integer(F.Green) - Integer(B.Green)) * Alpha div 255;
+        B.Blue := B.Blue + (Integer(F.Blue) - Integer(B.Blue)) * Alpha div 255;
+        B.Alpha := alphaOpaque;
+        BI.Colors[X, Y] := B;
+      end;
+    Bg.LoadFromIntfImage(BI);
+  finally
+    FI.Free;
+    BI.Free;
+  end;
+end;
+{$ENDIF}
 
 procedure TRenderer.PaintContentWithFloats(Box: TLayoutBox; const R: TRect);
-var
-  SavedList: Classes.TList;
-  SavedDefer: Boolean;
-  K: Integer;
 begin
-  SavedList := FDeferredFloats;
-  SavedDefer := FDeferFloats;
-  FDeferredFloats := Classes.TList.Create;
-  FDeferFloats := True;
-  try
-    DrawBoxContent(Box, R);
-    FDeferFloats := False;
-    for K := 0 to FDeferredFloats.Count - 1 do
-      DrawBox(TLayoutBox(FDeferredFloats[K]));
-  finally
-    FDeferredFloats.Free;
-    FDeferredFloats := SavedList;
-    FDeferFloats := SavedDefer;
-  end;
+  PaintLayer(Box, R, True);
 end;
 
 procedure TRenderer.PaintBoxOpacity(Box: TLayoutBox; const R: TRect);
@@ -1103,7 +1391,11 @@ var
   W, H, OldOX, OldOY, OldVH: Integer;
   OldCanvas: TCanvas;
   Tmp: Graphics.TBitmap;
+  {$IFDEF MSWINDOWS}
   Bf: TBlendFunc;
+  {$ELSE}
+  Bg: Graphics.TBitmap;
+  {$ENDIF}
   R2: TRect;
 begin
   W := R.Right - R.Left;
@@ -1119,7 +1411,7 @@ begin
     Tmp.PixelFormat := pf24bit;
     Tmp.SetSize(W, H);
     // copy the current background under the box — unpainted areas stay unchanged
-    Windows.BitBlt(Tmp.Canvas.Handle, 0, 0, W, H, Canvas.Handle,
+    BitBlt(Tmp.Canvas.Handle, 0, 0, W, H, Canvas.Handle,
       R.Left, R.Top, SRCCOPY);
 
     // redirect drawing to the buffer (the box maps to 0,0)
@@ -1134,12 +1426,26 @@ begin
     Canvas := OldCanvas; OffsetX := OldOX; OffsetY := OldOY; ViewHeight := OldVH;
 
     // blend the buffer with the background using a constant alpha
+    {$IFDEF MSWINDOWS}
     Bf.BlendOp := 0;           // AC_SRC_OVER
     Bf.BlendFlags := 0;
     Bf.SourceConstantAlpha := Round(Box.Style.Opacity * 255);
     Bf.AlphaFormat := 0;
     MsAlphaBlend(Canvas.Handle, R.Left, R.Top, W, H,
       Tmp.Canvas.Handle, 0, 0, W, H, Bf);
+    {$ELSE}
+    Bg := Graphics.TBitmap.Create;
+    try
+      Bg.PixelFormat := pf24bit;
+      Bg.SetSize(W, H);
+      BitBlt(Bg.Canvas.Handle, 0, 0, W, H, Canvas.Handle,
+        R.Left, R.Top, SRCCOPY);
+      BlendBitmaps(Bg, Tmp, Round(Box.Style.Opacity * 255));
+      Canvas.Draw(R.Left, R.Top, Bg);
+    finally
+      Bg.Free;
+    end;
+    {$ENDIF}
   finally
     Tmp.Free;
   end;

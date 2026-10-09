@@ -11,11 +11,14 @@ unit XelImageScale;
 //
 // The unit is self-contained with respect to GDI+ (its own initialization), so it
 // does not depend on the font layer (OTF.pas).
+//
+// GDI+ exists only on Windows; elsewhere both functions return False and the
+// caller draws with the LCL canvas instead.
 
 interface
 
 uses
-  Windows;
+  {$IFDEF MSWINDOWS}Windows{$ELSE}LCLType{$ENDIF};
 
 // Scales and draws an image via GDI+ (bicubic, preserving alpha).
 // Argb points to SrcW*SrcH 32bpp pixels in B,G,R,A order (like
@@ -32,6 +35,7 @@ function DrawImageArgbRounded(DC: HDC; Argb: PByte; SrcW, SrcH,
 
 implementation
 
+{$IFDEF MSWINDOWS}
 type
   GpStatus   = Integer;
   GpGraphics = Pointer;
@@ -185,10 +189,26 @@ begin
   end;
 end;
 
+{$ELSE}
+function DrawImageArgbScaled(DC: HDC; Argb: PByte; SrcW, SrcH: Integer;
+  DX, DY, DW, DH: Integer): Boolean;
+begin
+  Result := False;
+end;
+
+function DrawImageArgbRounded(DC: HDC; Argb: PByte; SrcW, SrcH,
+  DX, DY, DW, DH, RadX, RadY: Integer): Boolean;
+begin
+  Result := False;
+end;
+{$ENDIF}
+
 initialization
 
 finalization
+  {$IFDEF MSWINDOWS}
   if GReady and (GToken <> 0) then
     GdiplusShutdown(GToken);
+  {$ENDIF}
 
 end.

@@ -28,9 +28,18 @@ type
   TFragKind = (fkText, fkImage, fkControl, fkBox);
 
   // line fragment: a word, image, control or inline-block box
+  // an inline element with a background, border or padding; its fragments on a
+  // line are painted as one box behind them (CSS 2.1 10.8, 14.2)
+  TInlineDeco = record
+    Element: TDOMElement;
+    Style: TComputedStyle;
+  end;
+
   TLineFrag = class
   public
     Kind: TFragKind;
+    Decos: array of TInlineDeco;  // decorated inline ancestors, outermost first
+    DecoStart, DecoEnd: TDOMElement; // this fragment is where that element starts/ends
     Text: string;
     Style: TComputedStyle;  // owned by the engine
     R: TRect;               // absolute page coordinates
@@ -64,6 +73,9 @@ type
     BulletText: string;         // list marker for display:list-item
     ColSpan: Integer;           // colspan of a table cell (default 1)
     RowSpan: Integer;           // rowspan of a table cell (default 1)
+    // static position of an absolutely positioned box (CSS 2.1 10.3.7):
+    // where it would have been in the flow; Low(Integer) = not recorded
+    StaticX, StaticY: Integer;
     constructor Create;
     destructor Destroy; override;
   end;
@@ -71,6 +83,16 @@ type
   TFloatInfo = record
     R: TRect;
     Side: TCssFloat;
+  end;
+
+  // CSS 2.1 8.3.1: adjoining vertical margins collapse into one margin — the
+  // largest positive one plus the most negative one
+  TMarginStrut = record
+    Pos, Neg: Integer;
+    Forced: Integer;  // <> Low(Integer): the edge is already fixed (clearance)
+    procedure Clear;
+    procedure Add(M: Integer);
+    function ResolveAt(Y: Integer): Integer; // where the collapsed margin ends
   end;
 
   // result of a hit test at a page point — for the context menu, link targets etc.
@@ -93,6 +115,7 @@ type
     FFontCache: TDictionary<string, string>;
     FAnchors: TDictionary<string, Integer>;   // inline anchor name -> page Y
     FGenNodes: TObjectList<TDOMNode>; // generated content text nodes (owned)
+    FCompatMode: TDocCompatMode;      // of the document being laid out
     function StyleOf(E: TDOMElement; Parent: TComputedStyle): TComputedStyle;
     function NewInheritedStyle(Parent: TComputedStyle): TComputedStyle;
     procedure AddFloat(const R: TRect; Side: TCssFloat);
@@ -108,6 +131,10 @@ type
       OwnerE: TDOMElement): TLayoutBox;
     function BuildCellBox(C: TDOMElement; CSt, RowSt: TComputedStyle): TLayoutBox;
     procedure LayoutBlockBox(Box: TLayoutBox; CX, CW: Integer; var Y: Integer);
+    procedure LayoutBlockFlow(Box: TLayoutBox; CX, CW: Integer; var Y: Integer;
+      var Strut: TMarginStrut; IsRoot: Boolean; out ResolvedY: Integer);
+    function MaxContentWidth(Box: TLayoutBox): Integer;
+    procedure PositionOutOfFlow(Child: TLayoutBox; CBX, CBY, CBW, CBH: Integer);
     procedure LayoutTable(Box: TLayoutBox; CX, CW: Integer; var Y: Integer);
     procedure LayoutFlex(Box: TLayoutBox; CX, CW: Integer; var Y: Integer);
     procedure LayoutGrid(Box: TLayoutBox; CX, CW: Integer; var Y: Integer);
@@ -165,10 +192,64 @@ type
     function FindAnchorY(const AnId: string; out AY: Integer): Boolean;
   end;
 
+// An image element: <img>, or an <object> whose data is an image. Any other
+// <object> (unknown type, an HTML page, a plugin) shows its fallback
+// content — its children — as an ordinary inline element (HTML 4.01 13.3).
+function IsImageElement(E: TDOMElement): Boolean;
+// the image URL of an image element, as written in the attribute
+function ImageSourceAttr(E: TDOMElement): string;
+
 implementation
+
 
 uses
   XelUrl, XelForms;
+
+function ObjectShowsImage(E: TDOMElement): Boolean;
+var
+  Data, Typ, Mime, Path: string;
+  P: Integer;
+begin
+  Data := Trim(E.GetAttribute('data'));
+  Typ := LowerCase(Trim(E.GetAttribute('type')));
+  if Data = '' then
+    Exit(False);
+  if SameText(Copy(Data, 1, 5), 'data:') then
+  begin
+    // the type of a data: URL is in the URL itself
+    Mime := LowerCase(Copy(Data, 6, MaxInt));
+    P := Pos(',', Mime);
+    if P > 0 then Mime := Copy(Mime, 1, P - 1);
+    P := Pos(';', Mime);
+    if P > 0 then Mime := Copy(Mime, 1, P - 1);
+    Exit(Copy(Mime, 1, 6) = 'image/');
+  end;
+  if Typ <> '' then
+    Exit(Copy(Typ, 1, 6) = 'image/');
+  Path := LowerCase(Data);
+  P := Pos('?', Path);
+  if P > 0 then Path := Copy(Path, 1, P - 1);
+  P := Pos('#', Path);
+  if P > 0 then Path := Copy(Path, 1, P - 1);
+  Path := ExtractFileExt(Path);
+  Result := (Path = '.png') or (Path = '.jpg') or (Path = '.jpeg') or
+    (Path = '.gif') or (Path = '.webp') or (Path = '.bmp') or (Path = '.ico') or
+    (Path = '.svg');
+end;
+
+function IsImageElement(E: TDOMElement): Boolean;
+begin
+  Result := (E <> nil) and ((E.TagName = 'img') or
+    ((E.TagName = 'object') and ObjectShowsImage(E)));
+end;
+
+function ImageSourceAttr(E: TDOMElement): string;
+begin
+  if E.TagName = 'object' then
+    Result := E.GetAttribute('data')
+  else
+    Result := E.GetAttribute('src');
+end;
 
 // number of characters (UTF-8 code points) — for letter-spacing
 function CountGlyphs(const S: string): Integer;
@@ -232,6 +313,29 @@ begin
   inherited Destroy;
 end;
 
+procedure TMarginStrut.Clear;
+begin
+  Pos := 0;
+  Neg := 0;
+  Forced := Low(Integer);
+end;
+
+procedure TMarginStrut.Add(M: Integer);
+begin
+  if M > Pos then
+    Pos := M
+  else if M < Neg then
+    Neg := M;
+end;
+
+function TMarginStrut.ResolveAt(Y: Integer): Integer;
+begin
+  if Forced <> Low(Integer) then
+    Result := Forced
+  else
+    Result := Y + Pos + Neg;
+end;
+
 constructor TLayoutBox.Create;
 begin
   inherited Create;
@@ -239,6 +343,8 @@ begin
   Lines := TObjectList<TLineBox>.Create(True);
   ColSpan := 1;
   RowSpan := 1;
+  StaticX := Low(Integer);
+  StaticY := Low(Integer);
 end;
 
 destructor TLayoutBox.Destroy;
@@ -288,6 +394,7 @@ var
     L: string;
   begin
     L := LowerCase(F);
+    {$IFDEF MSWINDOWS}
     if L = 'serif' then
       Result := 'Times New Roman'
     else if L = 'sans-serif' then
@@ -302,6 +409,16 @@ var
       Result := 'Segoe UI'
     else
       Result := '';
+    {$ELSE}
+    // fontconfig resolves the CSS generic names itself to installed fonts
+    if (L = 'serif') or (L = 'sans-serif') or (L = 'monospace') or
+       (L = 'cursive') or (L = 'fantasy') then
+      Result := L
+    else if L = 'system-ui' then
+      Result := 'sans-serif'
+    else
+      Result := '';
+    {$ENDIF}
   end;
 
 var
@@ -310,7 +427,7 @@ begin
   if FFontCache.TryGetValue(FamilyList, Result) then
     Exit;
 
-  Result := 'Times New Roman';
+  Result := {$IFDEF MSWINDOWS}'Times New Roman'{$ELSE}'serif'{$ENDIF};
   Parts := TStringList.Create;
   try
     Parts.Delimiter := ',';
@@ -817,7 +934,7 @@ begin
   HeightExplicit := St.HeightPx >= 0;
   if (E <> nil) and Assigned(OnGetImageSize) then
   begin
-    Url := ResolveUrl(E.OwnerDocument.BaseUrl, E.GetAttribute('src'));
+    Url := ResolveUrl(E.OwnerDocument.BaseUrl, ImageSourceAttr(E));
     HasNatural := OnGetImageSize(Url, NW, NH) and (NW > 0) and (NH > 0);
   end;
 
@@ -975,34 +1092,112 @@ end;
 
 // ---- block layout ----
 
+// Lays out a box that starts a new formatting context for its parent's
+// purposes (table cells, flex items, floats, absolutely positioned boxes,
+// measurements, the root): its margins never collapse with its content.
+// Y in: where the top margin starts; out: below the bottom margin.
 procedure TLayoutEngine.LayoutBlockBox(Box: TLayoutBox; CX, CW: Integer;
   var Y: Integer);
 var
+  Strut: TMarginStrut;
+  ResY: Integer;
+begin
+  Strut.Clear;
+  LayoutBlockFlow(Box, CX, CW, Y, Strut, True, ResY);
+  Y := Strut.ResolveAt(Y);
+end;
+
+// Block layout in normal flow with margin collapsing (CSS 2.1 8.3.1, 9.5.2).
+// Y in: the flow position (bottom border edge of what came before, without
+// the pending margins, which are in Strut). Out: the bottom border edge of the
+// box (unchanged when the box collapsed through), and in Strut the margins that
+// are still pending below it. ResolvedY: where the pending margins were
+// resolved (the top border edge of the first box that has one), or
+// Low(Integer) when the box collapsed through. IsRoot: the box starts a new
+// block formatting context for its parent.
+procedure TLayoutEngine.LayoutBlockFlow(Box: TLayoutBox; CX, CW: Integer;
+  var Y: Integer; var Strut: TMarginStrut; IsRoot: Boolean; out ResolvedY: Integer);
+const
+  Unresolved = Low(Integer);
+var
   St: TComputedStyle;
   ML, MR, MT, MB: Integer;
-  ContentW, BBW, ContentX, InnerY, StartInnerY, ContentH, MaxW, MinW: Integer;
-  I, PrevMB, TmpY, AbsX, AbsY, FlowBottom, SavedFloats: Integer;
+  ContentW, BBW, ContentX, InnerY, ContentTop, ContentEnd, ContentH, MaxW, MinW: Integer;
+  I, AbsX, AbsY, BaseY, ChildRes, HypY, ClearTo, LineY, K: Integer;
   BfcLX, BfcRX: Integer;
   Child: TLayoutBox;
   ImgW, ImgH: Integer;
   IsImg, HasSpecifiedWidth, MaxWidthApplied: Boolean;
+  Bfc, TopSep, BottomSep, HasClearance: Boolean;
+  ChildStrut, Prior, OutStrut, TopStrut: TMarginStrut;
+  FirstIdx, LastIdx: Integer;
+  SavedCount: Integer;
+  SavedFloats: array of TFloatInfo;
+
+  // a new block formatting context: floats inside stay inside
+  procedure BeginBfc;
+  var
+    J: Integer;
+  begin
+    SavedCount := FFloatCount;
+    SetLength(SavedFloats, SavedCount);
+    for J := 0 to SavedCount - 1 do
+      SavedFloats[J] := FFloats[J];
+    FFloatCount := 0;
+  end;
+
+  function EndBfc: Integer; // bottom of the floats placed inside
+  var
+    J: Integer;
+  begin
+    Result := Low(Integer);
+    for J := 0 to FFloatCount - 1 do
+      Result := Max(Result, FFloats[J].R.Bottom);
+    FFloatCount := SavedCount;
+    for J := 0 to SavedCount - 1 do
+      FFloats[J] := SavedFloats[J];
+  end;
+
+  procedure ApplyRelative;
+  begin
+    if St.Position <> cpRelative then
+      Exit;
+    AbsX := 0;
+    AbsY := 0;
+    if St.PosLeft <> Low(Integer) then
+      AbsX := St.PosLeft
+    else if St.PosRight <> Low(Integer) then
+      AbsX := -St.PosRight;
+    if St.PosTop <> Low(Integer) then
+      AbsY := St.PosTop
+    else if St.PosBottom <> Low(Integer) then
+      AbsY := -St.PosBottom;
+    if (AbsX <> 0) or (AbsY <> 0) then
+      OffsetBox(Box, AbsX, AbsY);
+  end;
+
 begin
   St := Box.Style;
+  ResolvedY := Unresolved;
+  AbsY := 0;
 
-  // tables / flex / grid have their own layout algorithms
-  if St.Display = cdTable then
+  // tables / flex / grid have their own layout algorithms; they add their
+  // own margins, which still collapse with the margins next to them
+  if St.Display in [cdTable, cdFlex, cdGrid] then
   begin
-    LayoutTable(Box, CX, CW, Y);
-    Exit;
-  end;
-  if St.Display = cdFlex then
-  begin
-    LayoutFlex(Box, CX, CW, Y);
-    Exit;
-  end;
-  if St.Display = cdGrid then
-  begin
-    LayoutGrid(Box, CX, CW, Y);
+    ResolvePctMetrics(St, CW);
+    Strut.Add(St.MarginT);
+    Y := Strut.ResolveAt(Y) - St.MarginT;
+    ResolvedY := Y + St.MarginT;
+    Strut.Clear;
+    case St.Display of
+      cdTable: LayoutTable(Box, CX, CW, Y);
+      cdFlex: LayoutFlex(Box, CX, CW, Y);
+    else
+      LayoutGrid(Box, CX, CW, Y);
+    end;
+    Dec(Y, St.MarginB);
+    Strut.Add(St.MarginB);
     Exit;
   end;
 
@@ -1012,9 +1207,30 @@ begin
   MT := St.MarginT;
   MB := St.MarginB;
 
-  // clear — move below the floats (before determining the BFC band)
+  IsImg := IsImageElement(Box.Element);
+  Bfc := IsRoot or IsImg or (St.Float_ <> cfNone) or
+    (St.Position in [cpAbsolute, cpFixed]) or
+    (St.OverflowX <> coVisible) or (St.OverflowY <> coVisible) or
+    (St.Display in [cdInlineBlock, cdTableCell]);
+
+  // the top margin joins the margins before the box
+  Prior := Strut;
+  Strut.Add(MT);
+
+  // clearance (CSS 2.1 9.5.2): if the box would start above the floats it
+  // clears, its border edge goes to their bottom — also when that is above
+  // the position the margins would give (negative clearance, Acid2)
+  HasClearance := False;
+  ClearTo := 0;
   if St.Clear_ <> ccNone then
-    Y := ClearY(Y, St.Clear_);
+  begin
+    HypY := Strut.ResolveAt(Y);
+    ClearTo := ClearY(HypY, St.Clear_);   // max(position, bottom of the floats)
+    // as in browsers, any float the box clears (even one ending above it)
+    // gives it clearance: its position is fixed and margins after it no
+    // longer collapse through it (an empty "clear: both" div keeps them apart)
+    HasClearance := ClearY(Low(Integer) div 2, St.Clear_) > Low(Integer) div 2;
+  end;
 
   // A block that establishes a formatting context (overflow<>visible) does NOT overlap
   // floats — it narrows to the band next to the float. This way e.g. the border-bottom
@@ -1022,10 +1238,13 @@ begin
   // across the full width. Only when the width is auto and the float actually intrudes.
   if ((St.OverflowX <> coVisible) or (St.OverflowY <> coVisible)) and
      (St.Float_ = cfNone) and (St.Position <> cpAbsolute) and
-     (St.WidthPx < 0) and (St.WidthPct < 0) and
-     (not ((Box.Element <> nil) and (Box.Element.TagName = 'img'))) then
+     (St.WidthPx < 0) and (St.WidthPct < 0) and not IsImg then
   begin
-    GetLineBounds(Y + MT, 1, CX, CW, BfcLX, BfcRX);
+    if HasClearance then
+      HypY := ClearTo
+    else
+      HypY := Strut.ResolveAt(Y);
+    GetLineBounds(HypY, 1, CX, CW, BfcLX, BfcRX);
     if BfcRX - BfcLX < CW then
     begin
       CX := BfcLX;
@@ -1033,7 +1252,6 @@ begin
     end;
   end;
 
-  IsImg := (Box.Element <> nil) and (Box.Element.TagName = 'img');
   HasSpecifiedWidth := (St.WidthPx >= 0) or (St.WidthPct >= 0);
   MaxWidthApplied := False;
 
@@ -1109,78 +1327,200 @@ begin
   end;
 
   Box.X := CX + ML;
-  Box.Y := Y + MT;
   Box.W := BBW;
-
   ContentX := Box.X + St.BordL + St.PadL;
-  InnerY := Box.Y + St.BordT + St.PadT;
-  StartInnerY := InnerY;
 
+  // where the content starts: a border, padding or a new formatting context
+  // separates the top margin from the first child's; otherwise they collapse
+  // and the box's top edge is fixed only by its first in-flow content
+  TopSep := Bfc or (St.BordT > 0) or (St.PadT > 0);
+  if HasClearance then
+  begin
+    ResolvedY := Prior.ResolveAt(Y);
+    Box.Y := ClearTo;
+    // the box's own top margin still collapses with its first child's; the
+    // collapsed edge stays at the clearance position
+    ChildStrut.Clear;
+    ChildStrut.Add(MT);
+    ChildStrut.Forced := ClearTo;
+    if TopSep then
+      ChildStrut.Clear;
+  end
+  else if TopSep then
+  begin
+    Box.Y := Strut.ResolveAt(Y);
+    ResolvedY := Box.Y;
+    ChildStrut.Clear;
+  end
+  else
+  begin
+    Box.Y := Unresolved;
+    ChildStrut := Strut;
+  end;
+  Strut.Clear;
+  if Box.Y <> Unresolved then
+    BaseY := Box.Y + St.BordT + St.PadT
+  else
+    BaseY := Y;
+
+  if Bfc then
+    BeginBfc;
+  // the margins above the box: where it sits if it collapses through
+  TopStrut := ChildStrut;
+
+  InnerY := BaseY;
   if IsImg then
-    ContentH := ImgH
+    InnerY := BaseY + ImgH
   else if Box.InlineNodes <> nil then
   begin
-    LayoutInlineContent(Box, ContentX, ContentW, InnerY);
-    ContentH := InnerY - StartInnerY;
+    // line boxes fix the box's position; a block without any line box (only
+    // white space) stays empty and may collapse through
+    LineY := ChildStrut.ResolveAt(BaseY);
+    K := LineY;
+    LayoutInlineContent(Box, ContentX, ContentW, K);
+    if Box.Lines.Count > 0 then
+    begin
+      if Box.Y = Unresolved then
+      begin
+        Box.Y := LineY;
+        ResolvedY := LineY;
+      end;
+      ChildStrut.Clear;
+      InnerY := K;
+    end;
   end
   else if ((St.ColumnCount > 0) or (St.ColumnWidthPx > 0)) and
           (Box.Children.Count >= 1) then
   begin
+    if Box.Y = Unresolved then
+    begin
+      Box.Y := ChildStrut.ResolveAt(BaseY);
+      ResolvedY := Box.Y;
+      InnerY := Box.Y;
+    end
+    else
+      InnerY := ChildStrut.ResolveAt(InnerY);
+    ChildStrut.Clear;
     LayoutMultiCol(Box, ContentX, ContentW, InnerY);
-    ContentH := InnerY - StartInnerY;
   end
   else
   begin
-    PrevMB := -1;
+    // quirks mode: the default (user-agent) top margin of the first block and
+    // the bottom margin of the last one inside <body> or a table cell are
+    // ignored, as browsers do for pages without a DOCTYPE
+    if (FCompatMode = dcmQuirks) and (Box.Element <> nil) and
+       ((Box.Element.TagName = 'body') or (Box.Element.TagName = 'td') or
+        (Box.Element.TagName = 'th')) then
+    begin
+      FirstIdx := -1;
+      LastIdx := -1;
+      for I := 0 to Box.Children.Count - 1 do
+        if (Box.Children[I].Style.Position in [cpStatic, cpRelative]) and
+           (Box.Children[I].Style.Float_ = cfNone) then
+        begin
+          if FirstIdx < 0 then FirstIdx := I;
+          LastIdx := I;
+        end;
+      if (FirstIdx >= 0) and Box.Children[FirstIdx].Style.MarginTFromUA then
+        Box.Children[FirstIdx].Style.MarginT := 0;
+      if (LastIdx >= 0) and Box.Children[LastIdx].Style.MarginBFromUA then
+        Box.Children[LastIdx].Style.MarginB := 0;
+    end;
     for I := 0 to Box.Children.Count - 1 do
     begin
       Child := Box.Children[I];
       if Child.Style.Position in [cpAbsolute, cpFixed] then
-        Continue;
-      if Child.Style.Float_ <> cfNone then
-        PlaceFloat(Child, ContentX, ContentW, InnerY)
-      else
       begin
-        // collapse adjacent vertical margins: use max instead of sum
-        if PrevMB >= 0 then
-          Dec(InnerY, Min(PrevMB, Child.Style.MarginT));
-        LayoutBlockBox(Child, ContentX, ContentW, InnerY);
-        PrevMB := Child.Style.MarginB;
+        // remember where it would have been (static position)
+        Child.StaticX := ContentX;
+        Child.StaticY := ChildStrut.ResolveAt(InnerY);
+        Continue;
+      end;
+      if Child.Style.Float_ <> cfNone then
+      begin
+        // a float sits below the margins before it but does not consume them
+        PlaceFloat(Child, ContentX, ContentW, ChildStrut.ResolveAt(InnerY));
+        Continue;
+      end;
+      LayoutBlockFlow(Child, ContentX, ContentW, InnerY, ChildStrut, False, ChildRes);
+      if (ChildRes <> Unresolved) and (Box.Y = Unresolved) then
+      begin
+        Box.Y := ChildRes;
+        ResolvedY := ChildRes;
       end;
     end;
-    ContentH := InnerY - StartInnerY;
   end;
 
-  if St.HeightPx >= 0 then
+  // the bottom margin of the last child collapses with the box's own unless
+  // something separates them
+  BottomSep := Bfc or (St.BordB > 0) or (St.PadB > 0) or (St.HeightPx >= 0) or
+    (St.MinHeightPx > 0);
+
+  if Box.Y = Unresolved then
+  begin
+    // nothing in flow fixed the position: an empty block collapses through —
+    // its top and bottom margins and its children's all collapse together
+    if not BottomSep then
+    begin
+      ChildStrut.Add(MB);
+      // its top border edge is where it would be with a non-zero bottom
+      // border: below the margins above it only (CSS 2.1 8.3.1)
+      Box.Y := TopStrut.ResolveAt(BaseY);
+      Box.H := 0;
+      Strut := ChildStrut;
+      if Bfc then
+        EndBfc;
+      PlaceAbsChildren(Box, ContentX, ContentW, Box.Y, Box.Y);
+      ApplyRelative;
+      Exit; // Y unchanged, ResolvedY = Unresolved
+    end;
+    Box.Y := ChildStrut.ResolveAt(BaseY);
+    ResolvedY := Box.Y;
+    ChildStrut.Clear;
+    InnerY := Box.Y + St.BordT + St.PadT;
+  end;
+
+  ContentTop := Box.Y + St.BordT + St.PadT;
+  OutStrut.Clear;
+  if BottomSep then
+    ContentEnd := ChildStrut.ResolveAt(InnerY)  // the last child's margin stays inside
+  else
+  begin
+    ContentEnd := InnerY;
+    OutStrut := ChildStrut;                     // and escapes through the bottom
+    OutStrut.Forced := Low(Integer);
+  end;
+  OutStrut.Add(MB);
+  ContentH := Max(0, ContentEnd - ContentTop);
+
+  // a block formatting context contains its floats (CSS 2.1 10.6.7)
+  if Bfc then
+  begin
+    K := EndBfc;
+    if (K <> Low(Integer)) and (St.HeightPx < 0) then
+      ContentH := Max(ContentH, K - ContentTop);
+  end;
+
+  if IsImg then
+    ContentH := ImgH
+  else if St.HeightPx >= 0 then
     ContentH := St.HeightPx;
-  if St.MinHeightPx >= 0 then
-    ContentH := Max(ContentH, St.MinHeightPx);
+  // max-height first, then min-height: min-height wins (CSS 2.1 10.7)
   if St.MaxHeightPx >= 0 then
     ContentH := Min(ContentH, St.MaxHeightPx);
+  if St.MinHeightPx >= 0 then
+    ContentH := Max(ContentH, St.MinHeightPx);
 
   Box.H := St.BordT + St.PadT + ContentH + St.PadB + St.BordB;
-  FlowBottom := Box.Y + Box.H + MB;
 
-  PlaceAbsChildren(Box, ContentX, ContentW, StartInnerY,
+  PlaceAbsChildren(Box, ContentX, ContentW, ContentTop,
     Box.Y + Box.H - St.BordB - St.PadB);
+  ApplyRelative;
 
+  Y := Box.Y + Box.H;
   if St.Position = cpRelative then
-  begin
-    AbsX := 0;
-    AbsY := 0;
-    if St.PosLeft <> Low(Integer) then
-      AbsX := St.PosLeft
-    else if St.PosRight <> Low(Integer) then
-      AbsX := -St.PosRight;
-    if St.PosTop <> Low(Integer) then
-      AbsY := St.PosTop
-    else if St.PosBottom <> Low(Integer) then
-      AbsY := -St.PosBottom;
-    if (AbsX <> 0) or (AbsY <> 0) then
-      OffsetBox(Box, AbsX, AbsY);
-  end;
-
-  Y := FlowBottom;
+    Dec(Y, AbsY);  // relative offsets do not move the flow
+  Strut := OutStrut;
 end;
 
 // ---- table layout ----
@@ -1211,6 +1551,10 @@ begin
   St := Cell.Style;
   if St.WidthPx >= 0 then
     Exit(St.WidthPx + St.PadL + St.PadR + St.BordL + St.BordR);
+  // ordinary cells: the max-content width (a nested display:table with only
+  // a width, right floats, ...); tables, flex and grid are measured by layout
+  if not (St.Display in [cdTable, cdFlex, cdGrid]) then
+    Exit(MaxContentWidth(Cell));
 
   // lay the cell out with effectively unlimited width, measure the
   // widest content, then discard that throwaway layout. Left alignment
@@ -1225,8 +1569,8 @@ begin
   Cell.Style.TextAlign := SavedTA;
   FFloatCount := SavedFloats;
   ClearBoxLayout(Cell);
-  if Result < 16 then
-    Result := 16;
+  if Result < 0 then
+    Result := 0;   // an empty cell is 0 wide, as in browsers
 end;
 
 procedure TLayoutEngine.LayoutTable(Box: TLayoutBox; CX, CW: Integer;
@@ -1248,6 +1592,7 @@ var
   I, J, C, R, K, NCols, Span: Integer;
   ColPref, ColW, RowHs, RowYPos, ColX: array of Integer;
   Spacing, SpacingV, SumPref, AvailInner, UsedInner, Extra, Deficit, SpanSum: Integer;
+  CollapseH, CollapseV: Integer;
   SpecW, ContentW, ContentH: Integer;
   ML, MR, MT, MB: Integer;
   ContentX, InnerY, RowY, W, DX, DY, FinalH, SavedFloats, TmpY: Integer;
@@ -1385,7 +1730,7 @@ begin
     // preferred column widths
     SetLength(ColPref, NCols);
     for I := 0 to NCols - 1 do
-      ColPref[I] := 16;
+      ColPref[I] := 0;   // a column of empty cells is 0 wide
     for I := 0 to NGrid - 1 do
       if Grid[I].CSpan = 1 then
         ColPref[Grid[I].Col] :=
@@ -1445,7 +1790,18 @@ begin
       for I := 0 to NCols - 1 do
         ColW[I] := ColPref[I];
 
-    UsedInner := Spacing * (NCols + 1);
+    // border-collapse: neighbouring cells share one border — they overlap by
+    // the cell border width (the outer edges do not)
+    CollapseH := 0;
+    CollapseV := 0;
+    if St.BorderCollapse then
+      for I := 0 to NGrid - 1 do
+      begin
+        CollapseH := Max(CollapseH, Max(Grid[I].Cell.Style.BordL, Grid[I].Cell.Style.BordR));
+        CollapseV := Max(CollapseV, Max(Grid[I].Cell.Style.BordT, Grid[I].Cell.Style.BordB));
+      end;
+
+    UsedInner := Spacing * (NCols + 1) - CollapseH * Max(0, NCols - 1);
     for I := 0 to NCols - 1 do
       Inc(UsedInner, ColW[I]);
 
@@ -1475,14 +1831,14 @@ begin
     for I := 0 to NCols - 1 do
     begin
       ColX[I] := W;
-      Inc(W, ColW[I] + Spacing);
+      Inc(W, ColW[I] + Spacing - CollapseH);
     end;
 
     // lay out every cell at a temporary origin to learn its natural
     // height; floats inside a cell stay internal to that cell
     for I := 0 to NGrid - 1 do
     begin
-      W := (Grid[I].CSpan - 1) * Spacing;
+      W := (Grid[I].CSpan - 1) * (Spacing - CollapseH);
       for K := Grid[I].Col to Grid[I].Col + Grid[I].CSpan - 1 do
         Inc(W, ColW[K]);
       SavedFloats := FFloatCount;
@@ -1516,8 +1872,10 @@ begin
     for R := 0 to Rows.Count - 1 do
     begin
       RowYPos[R] := RowY;
-      Inc(RowY, RowHs[R] + SpacingV);
+      Inc(RowY, RowHs[R] + SpacingV - CollapseV);
     end;
+    if Rows.Count > 0 then
+      Inc(RowY, CollapseV); // the last row keeps its bottom border
 
     // move the cells into place, stretch them over their rows and apply
     // vertical alignment of the content
@@ -1527,7 +1885,7 @@ begin
       DX := ColX[Grid[I].Col] - Cell.X;
       DY := RowYPos[Grid[I].Row] - Cell.Y;
       OffsetBox(Cell, DX, DY);
-      FinalH := (Grid[I].RSpan - 1) * SpacingV;
+      FinalH := (Grid[I].RSpan - 1) * (SpacingV - CollapseV);
       for K := Grid[I].Row to Grid[I].Row + Grid[I].RSpan - 1 do
         Inc(FinalH, RowHs[K]);
       Cell.H := FinalH;
@@ -1563,48 +1921,154 @@ end;
 
 // Lays out and positions position:absolute children (out of flow). Shared
 // by blocks, flex and grid — without it abs children of flex/grid are not positioned.
+// Shrink-to-fit width (CSS 2.1 10.3.5): the border-box width of the content
+// when nothing wraps (max-content).
+function TLayoutEngine.MaxContentWidth(Box: TLayoutBox): Integer;
+var
+  St: TComputedStyle;
+  PB, W, InFlow, FloatRun, CW, I, J, TmpY, ImgH, SavedCount: Integer;
+  C: TLayoutBox;
+  SavedTA: TCssTextAlign;
+begin
+  St := Box.Style;
+  PB := St.PadL + St.PadR + St.BordL + St.BordR;
+  if IsImageElement(Box.Element) then
+  begin
+    ComputeImageSize(Box.Element, St, 100000, W, ImgH);
+    Exit(W + PB);
+  end;
+  if St.WidthPx >= 0 then
+  begin
+    if St.BoxSizing = cbsBorderBox then
+      Exit(Max(St.WidthPx, PB));
+    Exit(St.WidthPx + PB);
+  end;
+  if St.Display in [cdTable, cdFlex, cdGrid] then
+    Exit(MeasureCellPref(Box));
+
+  W := 0;
+  if Box.InlineNodes <> nil then
+  begin
+    // the widest line when nothing wraps
+    SavedTA := St.TextAlign;
+    St.TextAlign := ctaLeft;
+    SavedCount := FFloatCount;
+    FFloatCount := 0;
+    TmpY := 0;
+    LayoutInlineContent(Box, 0, 1000000, TmpY);
+    for I := 0 to Box.Lines.Count - 1 do
+      for J := 0 to Box.Lines[I].Frags.Count - 1 do
+        W := Max(W, Box.Lines[I].Frags[J].R.Right);
+    Box.Lines.Clear;
+    FFloatCount := SavedCount;
+    St.TextAlign := SavedTA;
+  end
+  else
+  begin
+    InFlow := 0;
+    FloatRun := 0;
+    for I := 0 to Box.Children.Count - 1 do
+    begin
+      C := Box.Children[I];
+      if C.Style.Position in [cpAbsolute, cpFixed] then
+        Continue;
+      CW := MaxContentWidth(C) + C.Style.MarginL + C.Style.MarginR;
+      if C.Style.Float_ <> cfNone then
+        Inc(FloatRun, Max(0, CW))
+      else
+        InFlow := Max(InFlow, CW);
+    end;
+    W := Max(InFlow, FloatRun);
+  end;
+  if St.MaxWidthPx >= 0 then
+    W := Min(W, St.MaxWidthPx);
+  if St.MinWidthPx >= 0 then
+    W := Max(W, St.MinWidthPx);
+  Result := Max(0, W) + PB;
+end;
+
+// Places an absolutely positioned (or fixed) box in its containing block
+// CBX,CBY,CBW,CBH (the padding box of the positioned ancestor, or the
+// viewport): CSS 2.1 10.3.7 / 10.6.4 — margins, shrink-to-fit width, the
+// static position for auto offsets.
+procedure TLayoutEngine.PositionOutOfFlow(Child: TLayoutBox; CBX, CBY, CBW, CBH: Integer);
+var
+  CS: TComputedStyle;
+  L, R, T, B, BW, TmpY, AbsX, AbsY, SavedCount, K: Integer;
+  HasL, HasR, HasT, HasB: Boolean;
+  SavedFloats: array of TFloatInfo;
+begin
+  CS := Child.Style;
+  ResolvePctMetrics(CS, CBW);
+  L := CS.PosLeft; R := CS.PosRight; T := CS.PosTop; B := CS.PosBottom;
+  HasL := L <> Low(Integer); HasR := R <> Low(Integer);
+  HasT := T <> Low(Integer); HasB := B <> Low(Integer);
+
+  // the box is a new formatting context: the outer floats do not apply
+  SavedCount := FFloatCount;
+  SetLength(SavedFloats, SavedCount);
+  for K := 0 to SavedCount - 1 do
+    SavedFloats[K] := FFloats[K];
+  FFloatCount := 0;
+  TmpY := 0;
+  if (CS.WidthPx < 0) and (CS.WidthPct < 0) and
+     not IsImageElement(Child.Element) then
+  begin
+    if HasL and HasR then
+      BW := CBW - L - R - CS.MarginL - CS.MarginR
+    else
+    begin
+      BW := CBW - CS.MarginL - CS.MarginR;
+      if HasL then Dec(BW, L);
+      if HasR then Dec(BW, R);
+      BW := Min(MaxContentWidth(Child), BW);
+    end;
+    BW := Max(0, BW);
+    LayoutBlockBox(Child, 0, BW + CS.MarginL + CS.MarginR, TmpY);
+  end
+  else
+    LayoutBlockBox(Child, 0, CBW, TmpY);
+  FFloatCount := SavedCount;
+  for K := 0 to SavedCount - 1 do
+    FFloats[K] := SavedFloats[K];
+
+  if HasL then
+    AbsX := CBX + L + CS.MarginL
+  else if HasR then
+    AbsX := CBX + CBW - R - CS.MarginR - Child.W
+  else if Child.StaticX <> Low(Integer) then
+    AbsX := Child.StaticX + CS.MarginL
+  else
+    AbsX := CBX + CS.MarginL;
+  if HasT then
+    AbsY := CBY + T + CS.MarginT
+  else if HasB then
+    AbsY := CBY + CBH - B - CS.MarginB - Child.H
+  else if Child.StaticY <> Low(Integer) then
+    AbsY := Child.StaticY + CS.MarginT
+  else
+    AbsY := CBY + CS.MarginT;
+  OffsetBox(Child, AbsX - Child.X, AbsY - Child.Y);
+end;
+
 procedure TLayoutEngine.PlaceAbsChildren(Box: TLayoutBox;
   ContentX, ContentW, ContentTop, BottomInner: Integer);
 var
-  I, AbsX, AbsY, TmpY, SavedFloats: Integer;
-  Child: TLayoutBox;
+  I: Integer;
+  St: TComputedStyle;
 begin
+  St := Box.Style;
   for I := 0 to Box.Children.Count - 1 do
-  begin
-    Child := Box.Children[I];
-    if Child.Style.Position <> cpAbsolute then
-      Continue;
-    SavedFloats := FFloatCount;   // an absolute box is out of flow
-    TmpY := 0;
-    if (Child.Style.WidthPx < 0) and (Child.Style.WidthPct < 0) and
-       not ((Child.Element <> nil) and (Child.Element.TagName = 'img')) then
+    if Box.Children[I].Style.Position = cpAbsolute then
     begin
-      // auto width: shrink to the content (shrink-to-fit)
-      LayoutBlockBox(Child, 0, 10000, TmpY);
-      AbsX := MeasureMaxRight(Child) - Child.X + Child.Style.PadR + Child.Style.BordR;
-      FFloatCount := SavedFloats;
-      if AbsX < 1 then AbsX := 1;
-      if AbsX > ContentW then AbsX := ContentW;
-      TmpY := 0;
-      LayoutBlockBox(Child, 0, AbsX, TmpY);
-    end
-    else
-      LayoutBlockBox(Child, 0, ContentW, TmpY);
-    FFloatCount := SavedFloats;
-    if Child.Style.PosLeft <> Low(Integer) then
-      AbsX := ContentX + Child.Style.PosLeft
-    else if Child.Style.PosRight <> Low(Integer) then
-      AbsX := ContentX + ContentW - Child.Style.PosRight - Child.W
-    else
-      AbsX := ContentX;
-    if Child.Style.PosTop <> Low(Integer) then
-      AbsY := ContentTop + Child.Style.PosTop
-    else if Child.Style.PosBottom <> Low(Integer) then
-      AbsY := BottomInner - Child.Style.PosBottom - Child.H
-    else
-      AbsY := ContentTop;
-    OffsetBox(Child, AbsX - Child.X, AbsY - Child.Y);
-  end;
+      // containing block = the padding box (CSS 2.1 10.1)
+      if Box.H > 0 then
+        PositionOutOfFlow(Box.Children[I], Box.X + St.BordL, Box.Y + St.BordT,
+          Max(0, Box.W - St.BordL - St.BordR), Max(0, Box.H - St.BordT - St.BordB))
+      else
+        PositionOutOfFlow(Box.Children[I], ContentX - St.PadL, ContentTop - St.PadT,
+          ContentW + St.PadL + St.PadR, Max(0, BottomInner - ContentTop) + St.PadT + St.PadB);
+    end;
 end;
 
 // Positions all position:fixed boxes relative to the viewport (0,0 ..
@@ -1612,47 +2076,18 @@ end;
 // offset. Called once after the main layout.
 procedure TLayoutEngine.PlaceFixedBoxes(Box: TLayoutBox);
 var
-  I, AbsX, AbsY, TmpY, SavedFloats, VW, VH: Integer;
+  I: Integer;
   Child: TLayoutBox;
 begin
   if Box = nil then Exit;
-  VW := Max(1, ViewportWidth);
-  VH := Max(1, ViewportHeight);
   for I := 0 to Box.Children.Count - 1 do
   begin
     Child := Box.Children[I];
     if Child.Style.Position = cpFixed then
     begin
-      SavedFloats := FFloatCount;
-      TmpY := 0;
-      if (Child.Style.WidthPx < 0) and (Child.Style.WidthPct < 0) and
-         not ((Child.Element <> nil) and (Child.Element.TagName = 'img')) then
-      begin
-        LayoutBlockBox(Child, 0, VW, TmpY);
-        AbsX := MeasureMaxRight(Child) - Child.X + Child.Style.PadR + Child.Style.BordR;
-        FFloatCount := SavedFloats;
-        if AbsX < 1 then AbsX := 1;
-        if AbsX > VW then AbsX := VW;
-        TmpY := 0;
-        LayoutBlockBox(Child, 0, AbsX, TmpY);
-      end
-      else
-        LayoutBlockBox(Child, 0, VW, TmpY);
-      FFloatCount := SavedFloats;
-
-      if Child.Style.PosLeft <> Low(Integer) then
-        AbsX := Child.Style.PosLeft
-      else if Child.Style.PosRight <> Low(Integer) then
-        AbsX := VW - Child.Style.PosRight - Child.W
-      else
-        AbsX := 0;
-      if Child.Style.PosTop <> Low(Integer) then
-        AbsY := Child.Style.PosTop
-      else if Child.Style.PosBottom <> Low(Integer) then
-        AbsY := VH - Child.Style.PosBottom - Child.H
-      else
-        AbsY := 0;
-      OffsetBox(Child, AbsX - Child.X, AbsY - Child.Y);
+      Child.StaticX := Low(Integer); // static position: not tracked in viewport space
+      Child.StaticY := Low(Integer);
+      PositionOutOfFlow(Child, 0, 0, Max(1, ViewportWidth), Max(1, ViewportHeight));
     end
     else
       PlaceFixedBoxes(Child); // look for nested fixed boxes
@@ -2438,18 +2873,18 @@ begin
     SavedFloats[K] := FFloats[K];
   FFloatCount := 0;
 
-  // lay out the float in temporary coordinates (0,0)
+  // lay out the float in temporary coordinates (0,0); an auto width shrinks
+  // to the content (shrink-to-fit, CSS 2.1 10.3.5)
   TempY := 0;
-  LayoutBlockBox(Box, 0, CW, TempY);
-
-  // auto width — shrink to the content (shrink-to-fit)
   if (St.WidthPx < 0) and (St.WidthPct < 0) and
-     not ((Box.Element <> nil) and (Box.Element.TagName = 'img')) then
+     not IsImageElement(Box.Element) then
   begin
-    UsedW := MeasureMaxRight(Box) - Box.X + St.PadR + St.BordR;
-    if (UsedW > 0) and (UsedW < Box.W) then
-      Box.W := UsedW;
-  end;
+    ResolvePctMetrics(St, CW);
+    UsedW := Max(0, Min(MaxContentWidth(Box), CW - St.MarginL - St.MarginR));
+    LayoutBlockBox(Box, 0, UsedW + St.MarginL + St.MarginR, TempY);
+  end
+  else
+    LayoutBlockBox(Box, 0, CW, TempY);
 
   // restore the parent's float context
   FFloatCount := SavedCount;
@@ -2485,7 +2920,8 @@ end;
 
 type
   TItemKind = (iiWord, iiSpace, iiBreak, iiImage, iiControl, iiBox,
-    iiAnchor); // zero-width marker recording an in-page anchor position
+    iiAnchor, // zero-width marker recording an in-page anchor position
+    iiGap);   // horizontal margin/border/padding of an inline element
 
   TInlineItem = class
   public
@@ -2498,6 +2934,8 @@ type
     Target: string;      // target attribute of the enclosing <a>
     W, H, Ascent: Integer;
     LineAdvance: Integer; // line height resulting from line-height
+    Decos: array of TInlineDeco;
+    DecoStart, DecoEnd: TDOMElement;
     destructor Destroy; override;
   end;
 
@@ -2513,6 +2951,54 @@ var
   Items: TObjectList<TInlineItem>;
   CurrentHref: string; // href of the <a> being walked, '' outside links
   CurrentTarget: string; // target attribute of the current <a>
+  // list-style-position: inside — the marker is an inline box at the start of
+  // the first line, so the first line starts this much further right
+  FirstIndent: Integer;
+
+  // width of an inside marker as XelRender draws it (bullet/number + a space,
+  // or the list-style-image scaled to the font size + a gap); 0 otherwise
+  function InsideMarkerWidth: Integer;
+  var
+    IW, IH: Integer;
+  begin
+    Result := 0;
+    if not Box.Style.ListInside or (Box.Style.Display <> cdListItem) then
+      Exit;
+    if (Box.Style.ListImage <> '') and Assigned(OnGetImageSize) and
+       OnGetImageSize(Box.Style.ListImage, IW, IH) and (IW > 0) and (IH > 0) then
+    begin
+      if IH > Box.Style.FontSizePx then
+        IW := MulDiv(IW, Box.Style.FontSizePx, IH);
+      Exit(IW + 6);
+    end;
+    if Box.BulletText <> '' then
+    begin
+      SetCanvasFont(Canvas, Box.Style);
+      Result := Canvas.TextWidth(Box.BulletText + ' ');
+    end;
+  end;
+
+  // line-height: normal = ascent + descent + the font's line gap
+  // (tmExternalLeading), as browsers compute it; the font must be selected
+  function NormalLineHeight(TH: Integer): Integer;
+  var
+    TM: TTextMetric;
+  begin
+    Result := TH;
+    if GetTextMetrics(Canvas.Handle, TM) then
+      Inc(Result, TM.tmExternalLeading);
+  end;
+
+  // used line-height in px
+  function LineHeightPx(St: TComputedStyle): Integer;
+  begin
+    Result := UsedLineHeight(St);
+    if Result < 0 then
+    begin
+      SetCanvasFont(Canvas, St);
+      Result := NormalLineHeight(Canvas.TextHeight('Hg'));
+    end;
+  end;
 
   procedure MeasureTextItem(It: TInlineItem);
   var
@@ -2533,7 +3019,11 @@ var
     else
       It.Ascent := Round(TH * 0.8);
     It.H := TH;
-    It.LineAdvance := Max(TH, Round(It.Style.FontSizePx * It.Style.LineHeight));
+    // line-height: normal = the font's own height; otherwise the given value,
+    // also when smaller than the font (the glyphs then overflow the line box)
+    It.LineAdvance := UsedLineHeight(It.Style);
+    if It.LineAdvance < 0 then
+      It.LineAdvance := NormalLineHeight(TH);
   end;
 
   procedure AddWord(const Word: string; St: TComputedStyle);
@@ -2574,7 +3064,7 @@ var
     It := TInlineItem.Create;
     It.Kind := iiBreak;
     It.Style := St;
-    It.LineAdvance := Max(1, Round(St.FontSizePx * St.LineHeight));
+    It.LineAdvance := Max(1, LineHeightPx(St));
     Items.Add(It);
   end;
 
@@ -2599,13 +3089,29 @@ var
     if W <= 0 then
       Exit;
     It := TInlineItem.Create;
-    It.Kind := iiSpace;
+    It.Kind := iiGap;
     It.Text := '';
     It.Style := St;
     It.W := W;
     It.H := 0;
     It.Ascent := 0;
     It.LineAdvance := 1;
+    Items.Add(It);
+  end;
+
+  // the start or end edge (border + padding) of a decorated inline element;
+  // also added when 0 wide, it marks on which line the element starts/ends
+  procedure AddEdge(W: Integer; St: TComputedStyle; E: TDOMElement; IsStart: Boolean);
+  var
+    It: TInlineItem;
+  begin
+    It := TInlineItem.Create;
+    It.Kind := iiGap;
+    It.Text := '';
+    It.Style := St;
+    It.W := Max(0, W);
+    It.LineAdvance := 1;
+    if IsStart then It.DecoStart := E else It.DecoEnd := E;
     Items.Add(It);
   end;
 
@@ -2786,7 +3292,7 @@ var
     // Measure at a large width and with left alignment, so that center/right
     // does not inflate the width; then lay out again at the shrunk width.
     if (St.WidthPx < 0) and (St.WidthPct < 0) and
-       not (E.TagName = 'img') then
+       not IsImageElement(E) then
     begin
       SavedTA := Sub.Style.TextAlign;
       Sub.Style.TextAlign := ctaLeft;
@@ -2837,6 +3343,8 @@ var
     St: TComputedStyle;
     Sub: TList<TDOMNode>;
     SavedHref, SavedTarget: string;
+    Decorated: Boolean;
+    DecoFrom: Integer;
   begin
     for I := 0 to Nodes.Count - 1 do
     begin
@@ -2856,6 +3364,10 @@ var
           AddAnchor(E.GetAttribute('name'), BaseStyle);
         if E.TagName = 'br' then
           AddBreak(BaseStyle)
+        else if (E.TagName = 'object') and IsImageElement(E) then
+          // an image <object> is a replaced box with its own padding, border
+          // and background
+          AddInlineBlockItem(E, St)
         else if E.TagName = 'img' then
         begin
           if St.Float_ <> cfNone then
@@ -2884,8 +3396,14 @@ var
             CurrentHref := E.GetAttribute('href');
             CurrentTarget := E.GetAttribute('target');
           end;
-          // horizontal margins of an inline element give spacing before/after the content
+          // horizontal margins of an inline element give spacing before/after
+          // the content; border and padding are inside its (decorated) box
           AddGap(St.MarginL, St);
+          Decorated := St.HasBgColor or (St.BordT + St.BordR + St.BordB + St.BordL > 0) or
+            (St.PadL + St.PadR > 0);
+          DecoFrom := Items.Count;
+          if Decorated then
+            AddEdge(St.BordL + St.PadL, St, E, True);
           Sub := TList<TDOMNode>.Create;
           try
             for J := 0 to E.ChildCount - 1 do
@@ -2893,6 +3411,20 @@ var
             CollectItems(Sub, St);
           finally
             Sub.Free;
+          end;
+          if Decorated then
+          begin
+            AddEdge(St.PadR + St.BordR, St, E, False);
+            // every item of the element carries it (outer elements end up first)
+            for J := DecoFrom to Items.Count - 1 do
+            begin
+              SetLength(Items[J].Decos, Length(Items[J].Decos) + 1);
+              Move(Items[J].Decos[0], Items[J].Decos[1],
+                (Length(Items[J].Decos) - 1) * SizeOf(TInlineDeco));
+              FillChar(Items[J].Decos[0], SizeOf(TInlineDeco), 0);
+              Items[J].Decos[0].Element := E;
+              Items[J].Decos[0].Style := St;
+            end;
           end;
           AddGap(St.MarginR, St);
           CurrentHref := SavedHref;
@@ -2905,11 +3437,37 @@ var
 var
   CurY: Integer;
   LineStart: Integer; // index of the first item of the current line
+  // CSS 2.1 10.8.1: every line box starts with a "strut", a zero-width inline
+  // box with the block's own font and line-height (not in quirks mode)
+  StrutAbove, StrutBelow: Integer;
+
+  procedure ComputeStrut;
+  var
+    TM: TTextMetric;
+    TH, A, L, HL: Integer;
+  begin
+    StrutAbove := 0;
+    StrutBelow := 0;
+    if FCompatMode = dcmQuirks then
+      Exit;
+    SetCanvasFont(Canvas, Box.Style);
+    TH := Canvas.TextHeight('Hg');
+    if GetTextMetrics(Canvas.Handle, TM) then
+      A := TM.tmAscent
+    else
+      A := Round(TH * 0.8);
+    L := UsedLineHeight(Box.Style);
+    if L < 0 then
+      L := NormalLineHeight(TH);
+    HL := (L - TH) div 2;
+    StrutAbove := A + HL;
+    StrutBelow := L - StrutAbove;
+  end;
 
   procedure EmitLine(FromIdx, ToIdx: Integer; ForcedAdvance: Integer);
   var
     Line: TLineBox;
-    I, PenX, LX, RX, FragTop: Integer;
+    I, PenX, LX, RX, FragTop, HL, TopBottomH: Integer;
     MaxAscent, MaxDescent, LineH, MaxAdvance: Integer;
     It: TInlineItem;
     Frag: TLineFrag;
@@ -2935,23 +3493,60 @@ var
       EstH := Max(EstH, Items[I].LineAdvance);
     GetLineBounds(CurY, Max(1, EstH), CX, CW, LX, RX);
 
-    MaxAscent := 0;
-    MaxDescent := 0;
-    MaxAdvance := 0;
+    // CSS 2.1 10.8: text sits on the baseline with half the leading
+    // (line-height - font height, may be negative) above and below; images
+    // and inline blocks stand on the baseline; the strut is always there
+    MaxAscent := StrutAbove;
+    MaxDescent := StrutBelow;
+    TopBottomH := 0;
     for I := FromIdx to ToIdx do
     begin
       It := Items[I];
-      MaxAscent := Max(MaxAscent, It.Ascent);
-      MaxDescent := Max(MaxDescent, It.H - It.Ascent);
-      MaxAdvance := Max(MaxAdvance, It.LineAdvance);
+      // vertical-align top/bottom: aligned to the line box itself, not to the
+      // baseline; they only make the line at least as tall as they are
+      if (It.Style <> nil) and (It.Style.VertAlign in [cvaTop, cvaBottom]) and
+         (It.Kind in [iiImage, iiBox, iiControl]) then
+      begin
+        TopBottomH := Max(TopBottomH, It.H);
+        Continue;
+      end;
+      case It.Kind of
+        iiWord, iiSpace:
+          begin
+            HL := (It.LineAdvance - It.H) div 2;
+            MaxAscent := Max(MaxAscent, It.Ascent + HL);
+            MaxDescent := Max(MaxDescent, It.LineAdvance - It.Ascent - HL);
+          end;
+        iiBreak, iiAnchor, iiGap:
+          ;
+      else
+        MaxAscent := Max(MaxAscent, It.Ascent);
+        MaxDescent := Max(MaxDescent, It.H - It.Ascent);
+      end;
     end;
-    LineH := Max(MaxAscent + MaxDescent, MaxAdvance);
+    // quirks mode: a line still takes the line-height of its text
+    if FCompatMode = dcmQuirks then
+      for I := FromIdx to ToIdx do
+        if Items[I].Kind in [iiWord, iiSpace] then
+        begin
+          MaxAdvance := MaxAscent + MaxDescent;
+          if Items[I].LineAdvance > MaxAdvance then
+            Inc(MaxDescent, Items[I].LineAdvance - MaxAdvance);
+        end;
+    LineH := Max(0, MaxAscent + MaxDescent);
+    if TopBottomH > LineH then
+    begin
+      Inc(MaxDescent, TopBottomH - LineH);
+      LineH := TopBottomH;
+    end;
 
     Line := TLineBox.Create;
     Line.Y := CurY;
     Line.H := LineH;
 
     PenX := LX;
+    if Box.Lines.Count = 0 then
+      Inc(PenX, FirstIndent);
     for I := FromIdx to ToIdx do
     begin
       It := Items[I];
@@ -2968,8 +3563,11 @@ var
       Frag.Href := It.Href;
       Frag.Target := It.Target;
       Frag.Ascent := It.Ascent;
+      Frag.Decos := Copy(It.Decos);
+      Frag.DecoStart := It.DecoStart;
+      Frag.DecoEnd := It.DecoEnd;
       case It.Kind of
-        iiWord, iiSpace:
+        iiWord, iiSpace, iiGap:
           begin
             Frag.Kind := fkText;
             Frag.Text := It.Text;
@@ -3039,6 +3637,7 @@ var
 
 var
   I, PenX, LX, RX, EstH: Integer;
+  LineX0: Integer; // where the pen starts on the current line
   It: TInlineItem;
   LastAdvance: Integer;
   Guard: Integer;
@@ -3049,10 +3648,13 @@ begin
     CurrentHref := '';
     CurrentTarget := '';
     CollectItems(Box.InlineNodes, Box.Style);
+    FirstIndent := InsideMarkerWidth;
+    ComputeStrut;
+    LineX0 := CX;
 
     CurY := Y;
     LineStart := 0;
-    LastAdvance := Max(1, Round(Box.Style.FontSizePx * Box.Style.LineHeight));
+    LastAdvance := Max(1, LineHeightPx(Box.Style));
 
     I := 0;
     PenX := -1;
@@ -3076,6 +3678,9 @@ begin
           Inc(Guard);
         until False;
         PenX := LX;
+        if Box.Lines.Count = 0 then
+          Inc(PenX, FirstIndent);
+        LineX0 := PenX;
         // skip spaces at the beginning of a line
         if It.Kind = iiSpace then
         begin
@@ -3097,7 +3702,7 @@ begin
       LastAdvance := Max(LastAdvance, It.LineAdvance);
 
       // does not fit — break the line (unless the line is empty)
-      if (PenX + It.W > RX) and (It.Kind <> iiSpace) and (PenX > LX) and
+      if (PenX + It.W > RX) and (It.Kind <> iiSpace) and (PenX > LineX0) and
          not It.Style.NoWrap then
       begin
         EmitLine(LineStart, I - 1, LastAdvance);
@@ -3186,8 +3791,8 @@ var
     begin
       HI.Element := Box.Element;
       // block <img>
-      if Box.Element.TagName = 'img' then
-        HI.ImageUrl := Box.Element.GetAttribute('src');
+      if IsImageElement(Box.Element) then
+        HI.ImageUrl := ImageSourceAttr(Box.Element);
     end;
     // children — deeper ones override the element
     for I := 0 to Box.Children.Count - 1 do
@@ -3340,6 +3945,7 @@ begin
   Html := Doc.DocumentElement;
   if Html = nil then
     Exit;
+  FCompatMode := Doc.CompatMode;
 
   BaseStyle := TComputedStyle.Create;
   FStyles.Add(BaseStyle);

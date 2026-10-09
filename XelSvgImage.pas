@@ -38,7 +38,8 @@ function RasterizeSvg(const SvgText: string; W, H: Integer): Graphics.TBitmap;
 implementation
 
 uses
-  Windows, IntfGraphics, GraphType, FPImage, XelSimpleSVG;
+  {$IFDEF MSWINDOWS}Windows,{$ELSE}LCLType, LCLIntf,{$ENDIF}
+  IntfGraphics, GraphType, FPImage, XelSimpleSVG;
 
 procedure SvgIntrinsicSize(const SvgText: string; out W, H: Integer);
 var

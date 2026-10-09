@@ -224,6 +224,9 @@ type
     function HitTest(X, Y: Integer): THitInfo;
 
     property Document: TDOMDocument read FDoc;
+    // the layout of the current page (boxes in page coordinates); read-only,
+    // for tools and tests that inspect the layout
+    property LayoutEngine: TLayoutEngine read FEngine;
     property URL: string read FDocUrl;           // current document
     property BaseUrl: string read FBaseUrl;      // after <base href>
     property Title: string read GetTitle;
@@ -303,7 +306,7 @@ procedure Register;
 implementation
 
 uses
-  Windows, Math, FPImage, FPReadGif, IntfGraphics, GraphType, base64, LazUTF8,
+  {$IFDEF MSWINDOWS}Windows,{$ENDIF} Math, FPImage, FPReadGif, IntfGraphics, GraphType, base64, LazUTF8,
   WebPImageX,     // TWebpImage, the WebP decoder (XelImageFormats package)
   OTF,            // font conversion and handling (WOFF/WOFF2/TTF/SVG -> OTF)
   XelHtmlParser, XelUrl,
@@ -756,8 +759,10 @@ end;
 // Actual loading — without firing OnNavigate (the caller has done that).
 procedure TXelHtml.NavigateCore(const Target: string);
 var
-  T: string;
+  T, Frag: string;
+  P: Integer;
   Res: TResource;
+  FS: TFileStream;
 begin
   T := Trim(Target);
   if T = '' then
@@ -773,15 +778,34 @@ begin
     Exit;
   end;
 
-  // local file
-  if SameText(Copy(T, 1, 8), 'file:///') then
-    T := StringReplace(Copy(T, 9, MaxInt), '/', '\', [rfReplaceAll]);
+  // local file; a fragment (page.html#top) is not part of the file name —
+  // unless a file with '#' in its name really exists
+  T := FileUrlToPath(T);
+  Frag := '';
+  P := Pos('#', T);
+  if (P > 0) and not FileExists(T) then
+  begin
+    Frag := Copy(T, P, MaxInt);
+    T := Copy(T, 1, P - 1);
+  end;
   if not FileExists(T) then
   begin
     DoLoadError(T, 'File not found: ' + T);
     Exit;
   end;
-  LoadFromFile(T);
+  if Frag = '' then
+    LoadFromFile(T)
+  else
+  begin
+    // the fragment travels in the base URL: LoadFromStream takes :target and
+    // the anchor to scroll to from there
+    FS := TFileStream.Create(T, fmOpenRead or fmShareDenyWrite);
+    try
+      LoadFromStream(FS, ExpandFileName(T) + Frag);
+    finally
+      FS.Free;
+    end;
+  end;
 end;
 
 procedure TXelHtml.LoadFromFile(const FileName: string);
@@ -1392,9 +1416,9 @@ begin
         ParseCss(E.TextContent, FBaseUrl, Sheet);
         HandleCssResources(Sheet); // fonts/imports/images from the inline style sheet
       end
-      else if E.TagName = 'img' then
+      else if IsImageElement(E) then  // <img>, or an <object> showing an image
       begin
-        Url := E.GetAttribute('src');
+        Url := ImageSourceAttr(E);
         if Url <> '' then
         begin
           if SameText(Copy(Url, 1, 5), 'data:') then
